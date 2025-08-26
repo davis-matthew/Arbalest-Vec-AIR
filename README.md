@@ -1,4 +1,4 @@
-# Arbalest-Vec - Dynamic Data Inconsistency Detector for OpenMP programs
+# Arbalest-Vec: SIMD-Accelerated Dynamic Data Inconsistency Detector for OpenMP programs
 
 This directory and its sub-directories contain the source code for a customized LLVM 15.
 We modified ThreadSanitizer (compiler-rt/lib/tsan) to implement a prototype of our data inconsistency detector.
