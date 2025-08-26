@@ -1,4 +1,4 @@
-# Arbalest-VEC - Dynamic Data Inconsistency Detector for OpenMP programs
+# Arbalest-Vec - Dynamic Data Inconsistency Detector for OpenMP programs
 
 This directory and its sub-directories contain the source code for a customized LLVM 15.
 We modified ThreadSanitizer (compiler-rt/lib/tsan) to implement a prototype of our data inconsistency detector.
@@ -6,9 +6,9 @@ In addition, we also implemented all OpenMP Tool interface (OMPT) callbacks for 
 
 Note: this prototype only supports the x86-64 architecture
 
-## How to install Arbalest-VEC
+## How to install Arbalest-Vec
 
-We have provided a bash script to help you install Arbalest-VEC.  
+We have provided a bash script to help you install Arbalest-Vec.  
 
 ```c
 install_arbalest.sh [BUILD_DIR] [INSTALL_DIR]
@@ -17,8 +17,8 @@ install_arbalest.sh [BUILD_DIR] [INSTALL_DIR]
 // [INSTALL_DIR]: the directory where the customized LLVM will be installed
 ```
 
-## How to use Arbalest-VEC
-We will use the following example (example.cpp) to show how to use Arbalest-VEC  
+## How to use Arbalest-Vec
+We will use the following example (example.cpp) to show how to use Arbalest-Vec  
 ```c
      1	#include <cstdio>
      2	#define N 1000
@@ -47,9 +47,9 @@ We will use the following example (example.cpp) to show how to use Arbalest-VEC
    ./example.exe
 ```
 
-### Arbalest-VEC's Output
+### Arbalest-Vec's Output
 
-Note: The line numbers in the Arbalest-VEC report may experience slight discrepancies, either shifting up or down. The underlying issue lies in ThreadSanitizer's inability to accurately retrieve every line number when OpenMP is enabled. We are actively working on resolving this issue to ensure accurate line numbers in the report.
+Note: The line numbers in the Arbalest-Vec report may experience slight discrepancies, either shifting up or down. The underlying issue lies in ThreadSanitizer's inability to accurately retrieve every line number when OpenMP is enabled. We are actively working on resolving this issue to ensure accurate line numbers in the report.
 
 ```c
 *****************************
@@ -77,4 +77,16 @@ a[3] = 3
 ThreadSanitizer: reported 1 warnings
 ```
 
+## Citing Arbalest-Vec
+If you are referring to Arbalest-Vec in a publication, please cite the following paper.
+```
+@inproceedings{yu2024facilitating,
+  title={Facilitating Bug Detection for OpenMP Offloading Applications},
+  author={Yu, Lechen and Jin, Feiyang and Jenke, Joachim and Sarkar, Vivek},
+  booktitle={SC24-W: Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis},
+  pages={189--195},
+  year={2024},
+  organization={IEEE}
+}
+```
 
