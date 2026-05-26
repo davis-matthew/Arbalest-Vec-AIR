@@ -65,6 +65,7 @@
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
+#include "llvm/Transforms/Instrumentation/Arbalest.h"
 #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
 #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
@@ -663,6 +664,12 @@ static void addSanitizers(const Triple &TargetTriple,
     if (LangOpts.Sanitize.has(SanitizerKind::Thread)) {
       MPM.addPass(ModuleThreadSanitizerPass());
       MPM.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
+      // Arbalest piggybacks on the TSan runtime; only schedule it when TSan
+      // is enabled. ModuleArbalestPass / ArbalestPass are no-ops unless the
+      // -mllvm -arbalest=1 flag is set (forwarded by the driver from
+      // -farbalest).
+      MPM.addPass(ModuleArbalestPass());
+      MPM.addPass(createModuleToFunctionPassAdaptor(ArbalestPass()));
     }
 
     auto ASanPass = [&](SanitizerMask Mask, bool CompileKernel) {

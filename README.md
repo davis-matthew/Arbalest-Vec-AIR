@@ -1,10 +1,18 @@
 # Arbalest-Vec: SIMD-Accelerated Dynamic Data Inconsistency Detector for OpenMP programs
 
 This directory and its sub-directories contain the source code for a customized LLVM 15.
-We modified ThreadSanitizer (compiler-rt/lib/tsan) to implement a prototype of our data inconsistency detector.
+The data inconsistency detector is implemented as a standalone LLVM instrumentation pass (`Arbalest`) that runs alongside ThreadSanitizer, plus runtime helpers added to TSan's runtime library (compiler-rt/lib/tsan).
 In addition, we also implemented all OpenMP Tool interface (OMPT) callbacks for OpenMP device offloading according to the 5.2 version specification.
 
 Note: this prototype only supports the x86-64 architecture
+
+## Architecture
+
+Arbalest's instrumentation lives in its own pass — separate from ThreadSanitizer — at:
+- `llvm/include/llvm/Transforms/Instrumentation/Arbalest.h`
+- `llvm/lib/Transforms/Instrumentation/Arbalest.cpp`
+
+The pass is scheduled immediately after the TSan passes in the clang pipeline. It still depends on TSan being enabled because the `__arbalest_*` runtime callbacks share state with the TSan runtime (`compiler-rt/lib/tsan/rtl/tsan_arbalest_*`).
 
 ## How to install Arbalest-Vec
 
@@ -39,6 +47,26 @@ We will use the following example (example.cpp) to show how to use Arbalest-Vec
 ### Compile the OpenMP program with OpenMP and ThreadSanitizer enabled
 ```c
    clang++ -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu -farbalest -fsanitize=thread -g -o example.exe example.cpp
+```
+
+The user-facing driver flag is still `-farbalest` (disable with `-fno-arbalest`). It requires both `-fopenmp` and `-fsanitize=thread`.
+
+Under the hood, `-farbalest` now forwards different `-mllvm` flags than earlier versions of this prototype:
+
+| Old (Arbalest fused into TSan) | New (standalone pass) |
+|---|---|
+| `-mllvm -tsan-arbalest=1` | `-mllvm -arbalest=1` |
+| `-mllvm -tsan-debug-info=1` | `-mllvm -arbalest-debug-info=1` |
+
+The `-arbalest-debug-info=1` flag is auto-added by the driver whenever `-g` is passed.
+
+If you are driving `opt` directly instead of `clang`, the new pass names registered in `PassRegistry.def` are:
+- Module pass: `arbalest-module`
+- Function pass: `arbalest`
+
+For example:
+```c
+   opt -passes='tsan-module,function(tsan),arbalest-module,function(arbalest)' -arbalest=1 input.ll -o output.bc
 ```
 
 ### Execute the OpenMP program

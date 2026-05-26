@@ -83,12 +83,6 @@ static cl::opt<bool> ClCompoundReadBeforeWrite(
     "tsan-compound-read-before-write", cl::init(false),
     cl::desc("Emit special compound instrumentation for reads-before-writes"),
     cl::Hidden);
-static cl::opt<bool> ClEnableArbalest(
-    "tsan-arbalest", cl::init(false),
-    cl::desc("Run Arbalest data inconsistency detector with TSan"), cl::Hidden);
-static cl::opt<bool> ClOMPDebugMode(
-    "tsan-debug-info", cl::init(false),
-    cl::desc("Instrument OpenMP outlined functions with debug info"), cl::Hidden);
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
@@ -105,9 +99,6 @@ STATISTIC(NumOmittedNonCaptured, "Number of accesses ignored due to capturing");
 const char kTsanModuleCtorName[] = "tsan.module_ctor";
 const char kTsanInitName[] = "__tsan_init";
 
-const char kArbalestModuleCtorName[] = "arbalest.module_ctor";
-const char kArbalestInitName[] = "__arbalest_init";
-
 namespace {
 
 /// ThreadSanitizer: instrument the code in module to find races.
@@ -117,7 +108,7 @@ namespace {
 /// ensures the __tsan_init function is in the list of global constructors for
 /// the module.
 struct ThreadSanitizer {
-  ThreadSanitizer() : Arb() {
+  ThreadSanitizer() {
     // Check options and warn user.
     if (ClInstrumentReadBeforeWrite && ClCompoundReadBeforeWrite) {
       errs()
@@ -142,21 +133,6 @@ private:
     unsigned Flags = 0;
   };
 
-  struct Arbalest {
-    Arbalest(){};
-    void initialize(Module &M);
-    void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local, SmallVectorImpl<Instruction *> &All);
-    bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
-    bool instrumentGEP(GetElementPtrInst *GEP, const DataLayout &DL);
-    static const size_t kNumberOfAccessSizes = 5;
-    FunctionCallee ArbalestRead[kNumberOfAccessSizes];
-    FunctionCallee ArbalestWrite[kNumberOfAccessSizes];
-    FunctionCallee ArbalestUnalignedRead[kNumberOfAccessSizes];
-    FunctionCallee ArbalestUnalignedWrite[kNumberOfAccessSizes];
-    FunctionCallee ArbalestCheckBound;
-    StringRef OutlinedFuncPrefix;
-  };
-
   void initialize(Module &M);
   bool instrumentLoadOrStore(const InstructionInfo &II, const DataLayout &DL);
   bool instrumentAtomic(Instruction *I, const DataLayout &DL);
@@ -164,8 +140,8 @@ private:
   void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
                                       SmallVectorImpl<InstructionInfo> &All,
                                       const DataLayout &DL);
-  static bool addrPointsToConstantData(Value *Addr, bool InvokedByTsan = true);
-  static int getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr, const DataLayout &DL, bool InvokedByTsan = true);
+  bool addrPointsToConstantData(Value *Addr);
+  int getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr, const DataLayout &DL);
   void InsertRuntimeIgnores(Function &F);
 
   Type *IntptrTy;
@@ -195,107 +171,16 @@ private:
   FunctionCallee TsanVptrUpdate;
   FunctionCallee TsanVptrLoad;
   FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
-  Arbalest Arb;
 };
 
-uint32_t insertGlobalVariableInfo(Module &M, SmallVector<Constant *> &GlobInfo) {
-  SmallVector<GlobalVariable*, 8> UserDefinedGlobs;
-  for (GlobalVariable &G : M.globals()) {
-    if (!G.getName().empty() && !G.getName().startswith(".") && !G.getName().startswith("llvm")) {
-      UserDefinedGlobs.push_back(&G);
-    }
-  }
-  if (!UserDefinedGlobs.empty()) {
-    SmallVector<uint64_t, 8> GVS;
-    SmallVector<Constant*, 8> GVN;
-    SmallVector<Constant*, 8> GV;
-    for (GlobalVariable *GP : UserDefinedGlobs) {
-      GVS.push_back(M.getDataLayout().getTypeStoreSize(GP->getValueType()).getFixedSize());
-      Constant *VarNameInitializer = ConstantDataArray::getString(M.getContext(), GP->getName());
-      GlobalVariable *VarName = new GlobalVariable(M, VarNameInitializer->getType(), false,
-                                                   GlobalValue::PrivateLinkage, VarNameInitializer);
-      GVN.push_back(VarName);
-      GV.push_back(GP);
-    }
-    ArrayType *SizeArrayTy = ArrayType::get(Type::getInt64Ty(M.getContext()), GVS.size());
-    ArrayType *PtrArrayTy = ArrayType::get(Type::getVoidTy(M.getContext())->getPointerTo(), GV.size());
-    ArrayType *NameArrayTy = ArrayType::get(Type::getInt8Ty(M.getContext())->getPointerTo(), GVN.size());
-    GlobalVariable *GlobalsSize = new GlobalVariable(
-        M, SizeArrayTy, false, GlobalValue::PrivateLinkage,
-        ConstantDataArray::get(M.getContext(), ArrayRef<uint64_t>(GVS)), "arbalest_global_size");
-    GlobalVariable *GlobalsName = new GlobalVariable(
-        M, NameArrayTy, false, GlobalValue::PrivateLinkage,
-        ConstantArray::get(NameArrayTy, ArrayRef<Constant *>(GVN)), "arbalest_global_name");
-    GlobalVariable *Globals = new GlobalVariable(
-        M, PtrArrayTy, false, GlobalValue::PrivateLinkage,
-        ConstantArray::get(PtrArrayTy, ArrayRef<Constant *>(GV)), "arbalest_global_ptr");
-    GlobInfo[0] = Globals;
-    GlobInfo[1] = GlobalsSize;
-    GlobInfo[2] = GlobalsName;
-    return UserDefinedGlobs.size();
-  } else {
-    return 0;
-  }
-}
-
 void insertModuleCtor(Module &M) {
-  SmallVector<Constant *> GlobInfo{nullptr, nullptr, nullptr};
-  uint32_t UserDefinedGlobNum = 0;
-  bool IsHostModule = (M.getTargetTriple() == "x86_64-unknown-linux-gnu");
-  if (IsHostModule) {
-    if (ClEnableArbalest) {
-      errs() << "Turn on Arbalest-related instrumentation" << (ClOMPDebugMode ? " with" : " without") << " debug info\n";
-      UserDefinedGlobNum = insertGlobalVariableInfo(M, GlobInfo);
-    } else {
-      errs() << "Turn off Arbalest-related instrumentation\n";
-    }
-  }
-
   getOrCreateSanitizerCtorAndInitFunctions(
       M, kTsanModuleCtorName, kTsanInitName, /*InitArgTypes=*/{},
       /*InitArgs=*/{},
       // This callback is invoked when the functions are created the first
       // time. Hook them into the global ctors list in that case:
       [&](Function *Ctor, FunctionCallee) { appendToGlobalCtors(M, Ctor, 0); });
-
-  if (IsHostModule && ClEnableArbalest) {
-    IntegerType *U32 = Type::getInt32Ty(M.getContext());
-    PointerType *PtrPtr =
-        Type::getVoidTy(M.getContext())->getPointerTo()->getPointerTo();
-    PointerType *U64Ptr = Type::getInt64PtrTy(M.getContext());
-    PointerType *StrPtr = Type::getInt8PtrTy(M.getContext())->getPointerTo();
-    getOrCreateSanitizerCtorAndInitFunctions(
-        M, kArbalestModuleCtorName, kArbalestInitName,
-        /*InitArgTypes=*/{U32, PtrPtr, U64Ptr, StrPtr},
-        /*InitArgs=*/
-        {ConstantInt::get(U32, UserDefinedGlobNum),
-         GlobInfo[0] ? GlobInfo[0] : ConstantPointerNull::get(PtrPtr),
-         GlobInfo[1] ? GlobInfo[1] : ConstantPointerNull::get(U64Ptr),
-         GlobInfo[2] ? GlobInfo[2] : ConstantPointerNull::get(StrPtr)},
-        // This callback is invoked when the functions are created the first
-        // time. Hook them into the global ctors list in that case:
-        [&](Function *Ctor, FunctionCallee) {
-          appendToGlobalCtors(M, Ctor, 0);
-        });
-  }
 }
-
-void setOmpOutlinedFuncPrefix(Module &M) {
-  StringRef OptPrefix = ".omp_outlined";
-  StringRef DebugPrefix = ".omp_outlined._debug__";
-  bool UseOptPrefix = true;
-  if (ClOMPDebugMode) {
-    for (auto &Func : M) {
-      if (Func.getName().startswith(DebugPrefix)) {
-        UseOptPrefix = false;
-        break;
-      }
-    }
-  }
-  M.addModuleFlag(Module::Error, "OmpOutlinedFuncPrefix", 
-                  MDString::get(M.getContext(), UseOptPrefix ? OptPrefix : DebugPrefix));
-}
-
 }  // namespace
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
@@ -309,9 +194,6 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
 PreservedAnalyses ModuleThreadSanitizerPass::run(Module &M,
                                                  ModuleAnalysisManager &MAM) {
   insertModuleCtor(M);
-  if (ClEnableArbalest) {
-    setOmpOutlinedFuncPrefix(M);
-  }
   return PreservedAnalyses::none();
 }
 void ThreadSanitizer::initialize(Module &M) {
@@ -467,10 +349,6 @@ void ThreadSanitizer::initialize(Module &M) {
   MemsetFn =
       M.getOrInsertFunction("memset", Attr, IRB.getInt8PtrTy(),
                             IRB.getInt8PtrTy(), IRB.getInt32Ty(), IntptrTy);
-  
-  if (ClEnableArbalest) {
-    Arb.initialize(M);
-  }
 }
 
 static bool isVtableAccess(Instruction *I) {
@@ -512,7 +390,7 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
   return true;
 }
 
-bool ThreadSanitizer::addrPointsToConstantData(Value *Addr, bool InvokedByTsan) {
+bool ThreadSanitizer::addrPointsToConstantData(Value *Addr) {
   // If this is a GEP, just analyze its pointer operand.
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Addr))
     Addr = GEP->getPointerOperand();
@@ -520,17 +398,13 @@ bool ThreadSanitizer::addrPointsToConstantData(Value *Addr, bool InvokedByTsan) 
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Addr)) {
     if (GV->isConstant()) {
       // Reads from constant globals can not race with any writes.
-      if (InvokedByTsan) {
-        NumOmittedReadsFromConstantGlobals++;
-      }
+      NumOmittedReadsFromConstantGlobals++;
       return true;
     }
   } else if (LoadInst *L = dyn_cast<LoadInst>(Addr)) {
     if (isVtableAccess(L)) {
       // Reads from a vtable pointer can not race with any writes.
-      if (InvokedByTsan) {
-        NumOmittedReadsFromVtable++;
-      }
+      NumOmittedReadsFromVtable++;
       return true;
     }
   }
@@ -652,7 +526,6 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   bool HasCalls = false;
   bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeThread);
   const DataLayout &DL = F.getParent()->getDataLayout();
-  SmallVector<Instruction*, 8> AllLoadsAndStoresForArbalest;
 
   // Traverse all instructions, collect loads/stores/returns, check for calls.
   for (auto &BB : F) {
@@ -668,15 +541,9 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
         if (isa<MemIntrinsic>(Inst))
           MemIntrinCalls.push_back(&Inst);
         HasCalls = true;
-        if (ClEnableArbalest) {
-          Arb.chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStoresForArbalest);
-        }
         chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
                                        DL);
       }
-    }
-    if (ClEnableArbalest) {
-      Arb.chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStoresForArbalest);
     }
     chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores, DL);
   }
@@ -707,22 +574,6 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
     assert(!F.hasFnAttribute(Attribute::SanitizeThread));
     if (HasCalls)
       InsertRuntimeIgnores(F);
-  }
-
-  if (ClEnableArbalest) {
-    for (auto Inst : AllLoadsAndStoresForArbalest) {
-      Arb.instrumentLoadOrStore(Inst, DL);
-    }
-
-    if (F.getName().startswith(Arb.OutlinedFuncPrefix)) {
-      for (auto &BB : F) {
-        for (auto &Inst : BB) {
-          if (isa<GetElementPtrInst>(Inst)) {
-            Arb.instrumentGEP(cast<GetElementPtrInst>(&Inst), DL);
-          }
-        }
-      }
-    }
   }
 
   // Instrument function entry/exit points if there were instrumented accesses.
@@ -968,140 +819,18 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
 }
 
 int ThreadSanitizer::getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr,
-                                              const DataLayout &DL,
-                                              bool InvokedByTsan) {
+                                              const DataLayout &DL) {
   assert(OrigTy->isSized());
   assert(
       cast<PointerType>(Addr->getType())->isOpaqueOrPointeeTypeMatches(OrigTy));
   uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
   if (TypeSize != 8  && TypeSize != 16 &&
       TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
-    if (InvokedByTsan) {
-      NumAccessesWithBadSize++;
-    }
+    NumAccessesWithBadSize++;
     // Ignore all unusual sizes.
     return -1;
   }
   size_t Idx = countTrailingZeros(TypeSize / 8);
   assert(Idx < kNumberOfAccessSizes);
   return Idx;
-}
-
-static int getMemoryAccessSize(Type *OrigTy, const DataLayout &DL) {
-  assert(OrigTy->isSized());
-  uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-  if (TypeSize != 8  && TypeSize != 16 && TypeSize != 32 && 
-      TypeSize != 64 && TypeSize != 128) {
-    // Ignore all unusual sizes.
-    return -1;
-  }
-  return TypeSize / 8;
-}
-
-void ThreadSanitizer::Arbalest::initialize(Module &M) {
-  IRBuilder<> IRB(M.getContext());
-  AttributeList Attr;
-  Attr = Attr.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-  OutlinedFuncPrefix = cast<MDString>(M.getModuleFlag("OmpOutlinedFuncPrefix"))->getString();
-  for (size_t i = 0; i < Arbalest::kNumberOfAccessSizes; ++i) {
-    const unsigned ByteSize = 1U << i;
-    const unsigned BitSize = ByteSize * 8;
-    std::string ByteSizeStr = utostr(ByteSize);
-    std::string BitSizeStr = utostr(BitSize);
-    SmallString<32> ReadName("__arbalest_read" + ByteSizeStr);
-    ArbalestRead[i] = M.getOrInsertFunction(ReadName, Attr, IRB.getVoidTy(),
-                                            IRB.getInt8PtrTy());
-
-    SmallString<32> WriteName("__arbalest_write" + ByteSizeStr);
-    ArbalestWrite[i] = M.getOrInsertFunction(WriteName, Attr, IRB.getVoidTy(),
-                                             IRB.getInt8PtrTy());
-
-    SmallString<64> UnalignedReadName("__arbalest_unaligned_read" +
-                                      ByteSizeStr);
-    ArbalestUnalignedRead[i] = M.getOrInsertFunction(
-        UnalignedReadName, Attr, IRB.getVoidTy(), IRB.getInt8PtrTy());
-
-    SmallString<64> UnalignedWriteName("__arbalest_unaligned_write" +
-                                       ByteSizeStr);
-    ArbalestUnalignedWrite[i] = M.getOrInsertFunction(
-        UnalignedWriteName, Attr, IRB.getVoidTy(), IRB.getInt8PtrTy());
-  }
-  SmallString<64> CheckBoundName("__arbalest_check_bound");
-  ArbalestCheckBound = M.getOrInsertFunction(
-      CheckBoundName, Attr, IRB.getVoidTy(), IRB.getInt8PtrTy(),
-      IRB.getInt8PtrTy(), IRB.getInt32Ty());
-}
-
-void ThreadSanitizer::Arbalest::chooseInstructionsToInstrument(
-    SmallVectorImpl<Instruction *> &Local,
-    SmallVectorImpl<Instruction *> &All) {
-  for (Instruction *I : reverse(Local)) {
-    const bool IsWrite = isa<StoreInst>(*I);
-    Value *Addr = IsWrite ? cast<StoreInst>(I)->getPointerOperand()
-                          : cast<LoadInst>(I)->getPointerOperand();
-
-    if (!shouldInstrumentReadWriteFromAddress(I->getModule(), Addr))
-      continue;
-
-    if (!IsWrite) {
-      if (addrPointsToConstantData(Addr, false)) {
-        // Addr points to some constant data -- no data inconsistency will arise.
-        continue;
-      }
-    }
-
-    // Instrument this instruction.
-    All.emplace_back(I);
-  }
-}
-
-bool ThreadSanitizer::Arbalest::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
-  InstrumentationIRBuilder IRB(I);
-  const bool IsWrite = isa<StoreInst>(*I);
-  Value *Addr = IsWrite ? cast<StoreInst>(I)->getPointerOperand()
-                        : cast<LoadInst>(I)->getPointerOperand();
-  Type *OrigTy = getLoadStoreType(I);
-
-  // swifterror memory addresses are mem2reg promoted by instruction selection.
-  // As such they cannot have regular uses like an instrumentation function and
-  // it makes no sense to track them as memory.
-  if (Addr->isSwiftError())
-    return false;
-
-  int Idx = getMemoryAccessFuncIndex(OrigTy, Addr, DL, false);
-  if (Idx < 0)
-    return false;
-  if (isVtableAccess(I)) {
-    // ignore vptr update.
-    return true;
-  }
-
-  const Align Alignment = IsWrite ? cast<StoreInst>(I)->getAlign()
-                                  : cast<LoadInst>(I)->getAlign();
-
-  const uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-  FunctionCallee OnAccessFunc = nullptr;
-  if (Alignment >= Align(8) || (Alignment.value() % (TypeSize / 8)) == 0) {
-      OnAccessFunc = IsWrite ? ArbalestWrite[Idx] : ArbalestRead[Idx];
-  } else {
-      OnAccessFunc = IsWrite ? ArbalestUnalignedWrite[Idx] : ArbalestUnalignedRead[Idx];
-  }
-  IRB.CreateCall(OnAccessFunc, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
-  return true;
-}
-
-bool ThreadSanitizer::Arbalest::instrumentGEP(GetElementPtrInst *GEP, const DataLayout &DL) {
-  Value *BasePtr = GEP->getOperand(0);
-  for (auto UIt = GEP->use_begin(), UEnd = GEP->use_end(); UIt != UEnd; UIt++) {
-    User *U = UIt->getUser();
-    if (isa<LoadInst>(U)) {
-      LoadInst *LI = cast<LoadInst>(U);
-      InstrumentationIRBuilder IRB(LI);
-      Type *OrigTy = getLoadStoreType(LI);
-      int Size = getMemoryAccessSize(OrigTy, DL);
-      assert(size > 0);
-      IRB.CreateCall(ArbalestCheckBound, {IRB.CreatePointerCast(BasePtr, IRB.getInt8PtrTy()), IRB.CreatePointerCast(GEP, IRB.getInt8PtrTy()), IRB.getInt32(Size)});
-    }
-  }
-  return true;
 }
