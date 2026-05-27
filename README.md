@@ -60,6 +60,44 @@ Under the hood, `-farbalest` now forwards different `-mllvm` flags than earlier 
 
 The `-arbalest-debug-info=1` flag is auto-added by the driver whenever `-g` is passed.
 
+### Access dedup (default on)
+
+By default the Arbalest pass elides redundant runtime callbacks. Under OpenMP's
+serial-elision execution model, the detector only needs to observe the *first*
+read of an address and the *first* write that follows it (or the *first* write,
+if it precedes any read) within each call-bounded region. The pass tracks
+per-address state during a single function walk, resets state at every
+call/invoke (which may launch a kernel), and skips emitting `__arbalest_read*`
+/ `__arbalest_write*` for accesses whose verdict cannot change.
+
+The aggressiveness of "same address" detection is controlled by
+`-mllvm -arbalest-dedupe-mode=<mode>`:
+
+| Mode | What it dedupes on | Cost | When to use |
+|---|---|---|---|
+| `off` | nothing — instrument every eligible access | none | baseline / debugging the runtime |
+| `value` | raw pointer SSA value (TSan-style) | free | conservative, matches TSan's own dedup |
+| `strip` *(default)* | pointer after `stripPointerCasts()` | O(1) per access | catches trivial bitcast chains; relies on prior GVN/EarlyCSE for most equivalent-address cases |
+| `aa` | AliasAnalysis `MustAlias` queries on `MemoryLocation` | O(N²·AA) per function | most precise; catches semantically equal GEPs that GVN didn't merge |
+
+Examples:
+
+```c
+   # Disable dedup (baseline overhead measurement):
+   clang++ ... -farbalest -fsanitize=thread -mllvm -arbalest-dedupe-mode=off ...
+
+   # Use AA-based MustAlias dedup (tighter but slower at compile time):
+   clang++ ... -farbalest -fsanitize=thread -mllvm -arbalest-dedupe-mode=aa ...
+```
+
+You can see how many accesses were elided vs. instrumented by adding
+`-mllvm -stats` to the clang invocation; look for
+`NumInstrumentedArbalestAccesses` and `NumElidedArbalestAccesses`.
+
+Note that GEP bounds checks (`__arbalest_check_bound`) are not affected by this
+dedup — they need to fire on every dynamic execution because the index varies
+across loop iterations.
+
 If you are driving `opt` directly instead of `clang`, the new pass names registered in `PassRegistry.def` are:
 - Module pass: `arbalest-module`
 - Function pass: `arbalest`

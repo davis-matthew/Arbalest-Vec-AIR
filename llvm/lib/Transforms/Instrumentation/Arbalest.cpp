@@ -15,10 +15,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Instrumentation/Arbalest.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -51,6 +55,47 @@ static cl::opt<bool> ClOMPDebugMode(
     cl::desc("Instrument OpenMP outlined functions with debug info"),
     cl::Hidden);
 
+// Per-address access dedup: under OpenMP's serial-elision execution model, the
+// runtime VSM only needs to observe the first read of an address and the first
+// write that follows it (or the first write, if it precedes any read). Further
+// accesses to the same address inside the same call-bounded region cannot
+// change the detector's verdict, so we elide them. Calls and invokes reset the
+// per-address state because the callee may launch a kernel (or otherwise
+// mutate memory) that re-arms detection for tracked addresses.
+//
+// The mode controls how two accesses are recognized as targeting the "same"
+// address:
+//   off    - no dedup; instrument every eligible access
+//   value  - dedup on raw pointer SSA value (TSan-style)
+//   strip  - dedup on stripPointerCasts()'d pointer (default)
+//   aa     - dedup via AliasAnalysis MustAlias queries (most precise; costs
+//            O(N^2 * AA) per function in the worst case)
+enum DedupeMode {
+  DM_Off,
+  DM_Value,
+  DM_Strip,
+  DM_AA,
+};
+
+static cl::opt<DedupeMode> ClDedupeMode(
+    "arbalest-dedupe-mode", cl::init(DM_Strip),
+    cl::desc("How aggressively Arbalest dedupes redundant memory accesses"),
+    cl::values(
+        clEnumValN(DM_Off, "off",
+                   "No dedup; instrument every eligible access"),
+        clEnumValN(DM_Value, "value",
+                   "Dedup on raw pointer SSA value (TSan-style)"),
+        clEnumValN(DM_Strip, "strip",
+                   "Dedup on stripPointerCasts'd pointer (default)"),
+        clEnumValN(DM_AA, "aa",
+                   "Dedup via MustAlias queries (precise, more expensive)")),
+    cl::Hidden);
+
+STATISTIC(NumInstrumentedArbalestAccesses,
+          "Number of load/store accesses Arbalest instrumented");
+STATISTIC(NumElidedArbalestAccesses,
+          "Number of load/store accesses Arbalest elided by dedup");
+
 namespace {
 
 constexpr char kArbalestModuleCtorName[] = "arbalest.module_ctor";
@@ -61,16 +106,15 @@ constexpr size_t kNumberOfAccessSizes = 5;
 
 class Arbalest {
 public:
-  Arbalest() = default;
+  explicit Arbalest(AAResults *AA = nullptr) : AA(AA) {}
   bool sanitizeFunction(Function &F);
 
 private:
   void initialize(Module &M);
-  void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
-                                      SmallVectorImpl<Instruction *> &All);
   bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
   bool instrumentGEP(GetElementPtrInst *GEP, const DataLayout &DL);
 
+  AAResults *AA;
   FunctionCallee ArbalestRead[kNumberOfAccessSizes];
   FunctionCallee ArbalestWrite[kNumberOfAccessSizes];
   FunctionCallee ArbalestUnalignedRead[kNumberOfAccessSizes];
@@ -250,13 +294,124 @@ PreservedAnalyses ModuleArbalestPass::run(Module &M, ModuleAnalysisManager &) {
   return PreservedAnalyses::none();
 }
 
-PreservedAnalyses ArbalestPass::run(Function &F, FunctionAnalysisManager &) {
+PreservedAnalyses ArbalestPass::run(Function &F, FunctionAnalysisManager &FAM) {
   if (!ClEnableArbalest)
     return PreservedAnalyses::all();
-  Arbalest A;
+  // AA is only needed for the `aa` dedup mode. Request it lazily so the other
+  // modes don't pay the AA pipeline cost.
+  AAResults *AA =
+      (ClDedupeMode == DM_AA) ? &FAM.getResult<AAManager>(F) : nullptr;
+  Arbalest A(AA);
   if (A.sanitizeFunction(F))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
+}
+
+// Per-address state for the dedup pass. See ClDedupeMode for the model.
+namespace {
+enum AccessState : uint8_t {
+  AS_NoAccess = 0,
+  AS_SeenRead,     // we have already emitted a read for this address
+  AS_SeenWrite,    // we have already emitted a write; no further emits needed
+};
+
+// Apply the (NoAccess|SeenRead|SeenWrite) state machine to a single access.
+// Returns true if the access should be instrumented; updates `S` in place.
+bool stepAccessState(AccessState &S, bool IsWrite) {
+  switch (S) {
+  case AS_NoAccess:
+    S = IsWrite ? AS_SeenWrite : AS_SeenRead;
+    return true;
+  case AS_SeenRead:
+    if (IsWrite) {
+      S = AS_SeenWrite;
+      return true;
+    }
+    return false;
+  case AS_SeenWrite:
+    return false;
+  }
+  llvm_unreachable("invalid AccessState");
+}
+} // namespace
+
+// Linear-scan dedup keyed on AA::alias(... MustAlias). Used only when the
+// dedup mode is `aa`. Returns a pointer into State or nullptr if no existing
+// entry MustAlias's `Loc`.
+static AccessState *findMustAliasState(
+    SmallVectorImpl<std::pair<MemoryLocation, AccessState>> &State,
+    const MemoryLocation &Loc, AAResults &AA) {
+  for (auto &Entry : State) {
+    if (AA.alias(Loc, Entry.first) == AliasResult::MustAlias)
+      return &Entry.second;
+  }
+  return nullptr;
+}
+
+static void collectAccessesWithDedup(Function &F, AAResults *AA,
+                                     SmallVectorImpl<Instruction *> &Out) {
+  // For value/strip modes we can use a hash map keyed on a Value*.
+  DenseMap<Value *, AccessState> AddrState;
+  // For aa mode we store MemoryLocation/state pairs and do a linear MustAlias
+  // scan, since MemoryLocations aren't trivially hashable for "same address"
+  // semantics.
+  SmallVector<std::pair<MemoryLocation, AccessState>, 8> AAState;
+
+  const Module *M = F.getParent();
+  for (auto &BB : F) {
+    for (auto &Inst : BB) {
+      // A call/invoke may launch a kernel or otherwise mutate memory; treat it
+      // as a region boundary by resetting per-address state.
+      if ((isa<CallInst>(Inst) && !isa<DbgInfoIntrinsic>(Inst)) ||
+          isa<InvokeInst>(Inst)) {
+        AddrState.clear();
+        AAState.clear();
+        continue;
+      }
+      if (!isa<LoadInst>(Inst) && !isa<StoreInst>(Inst))
+        continue;
+
+      const bool IsWrite = isa<StoreInst>(Inst);
+      Value *Addr = IsWrite ? cast<StoreInst>(&Inst)->getPointerOperand()
+                            : cast<LoadInst>(&Inst)->getPointerOperand();
+
+      if (!shouldInstrumentReadWriteFromAddress(M, Addr))
+        continue;
+      if (!IsWrite && addrPointsToConstantData(Addr))
+        continue;
+
+      bool Emit;
+      switch (ClDedupeMode) {
+      case DM_Off:
+        Emit = true;
+        break;
+      case DM_Value:
+      case DM_Strip: {
+        Value *Key = (ClDedupeMode == DM_Strip) ? Addr->stripPointerCasts()
+                                                : Addr;
+        Emit = stepAccessState(AddrState[Key], IsWrite);
+        break;
+      }
+      case DM_AA: {
+        assert(AA && "aa dedup mode requires AAResults");
+        MemoryLocation Loc = MemoryLocation::get(&Inst);
+        if (AccessState *S = findMustAliasState(AAState, Loc, *AA)) {
+          Emit = stepAccessState(*S, IsWrite);
+        } else {
+          AccessState NewS = AS_NoAccess;
+          Emit = stepAccessState(NewS, IsWrite);
+          AAState.emplace_back(Loc, NewS);
+        }
+        break;
+      }
+      }
+
+      if (Emit)
+        Out.push_back(&Inst);
+      else
+        ++NumElidedArbalestAccesses;
+    }
+  }
 }
 
 bool Arbalest::sanitizeFunction(Function &F) {
@@ -270,24 +425,19 @@ bool Arbalest::sanitizeFunction(Function &F) {
   initialize(*F.getParent());
 
   const DataLayout &DL = F.getParent()->getDataLayout();
-  SmallVector<Instruction *, 8> AllLoadsAndStores;
-  SmallVector<Instruction *, 8> LocalLoadsAndStores;
+  SmallVector<Instruction *, 16> AllLoadsAndStores;
 
-  for (auto &BB : F) {
-    for (auto &Inst : BB) {
-      if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
-        LocalLoadsAndStores.push_back(&Inst);
-      } else if ((isa<CallInst>(Inst) && !isa<DbgInfoIntrinsic>(Inst)) ||
-                 isa<InvokeInst>(Inst)) {
-        chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores);
-      }
-    }
-    chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores);
-  }
+  // All four dedup modes are handled inside collectAccessesWithDedup. DM_Off
+  // simply emits every eligible access.
+  collectAccessesWithDedup(F, AA, AllLoadsAndStores);
 
   bool Res = false;
-  for (auto *Inst : AllLoadsAndStores)
-    Res |= instrumentLoadOrStore(Inst, DL);
+  for (auto *Inst : AllLoadsAndStores) {
+    if (instrumentLoadOrStore(Inst, DL)) {
+      Res = true;
+      ++NumInstrumentedArbalestAccesses;
+    }
+  }
 
   if (F.getName().startswith(OutlinedFuncPrefix)) {
     for (auto &BB : F) {
@@ -333,23 +483,6 @@ void Arbalest::initialize(Module &M) {
   ArbalestCheckBound = M.getOrInsertFunction(
       "__arbalest_check_bound", Attr, IRB.getVoidTy(), IRB.getInt8PtrTy(),
       IRB.getInt8PtrTy(), IRB.getInt32Ty());
-}
-
-void Arbalest::chooseInstructionsToInstrument(
-    SmallVectorImpl<Instruction *> &Local,
-    SmallVectorImpl<Instruction *> &All) {
-  for (Instruction *I : reverse(Local)) {
-    const bool IsWrite = isa<StoreInst>(*I);
-    Value *Addr = IsWrite ? cast<StoreInst>(I)->getPointerOperand()
-                          : cast<LoadInst>(I)->getPointerOperand();
-
-    if (!shouldInstrumentReadWriteFromAddress(I->getModule(), Addr))
-      continue;
-    if (!IsWrite && addrPointsToConstantData(Addr))
-      continue;
-    All.emplace_back(I);
-  }
-  Local.clear();
 }
 
 bool Arbalest::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
