@@ -55,6 +55,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_unaligned_write16(void *addr);
 
 SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_check_bound(void *base, void *start, unsigned size);
 
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_read_range(void *start, void *end);
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_write_range(void *start, void *end);
+
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_read_stride(void *start, void *end,
+    __sanitizer::uptr step, __sanitizer::uptr elem_bytes);
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_write_stride(void *start, void *end,
+    __sanitizer::uptr step, __sanitizer::uptr elem_bytes);
+
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_read_cstride(void *start, void *end,
+    __sanitizer::uptr step, __sanitizer::uptr elem_bytes);
+SANITIZER_INTERFACE_ATTRIBUTE void __arbalest_write_cstride(void *start, void *end,
+    __sanitizer::uptr step, __sanitizer::uptr elem_bytes);
+
 // This function should be called at the very beginning of the process,
 // before any instrumented code is executed and before any call to malloc.
 SANITIZER_INTERFACE_ATTRIBUTE void __tsan_init();

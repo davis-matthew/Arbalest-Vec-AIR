@@ -16,13 +16,17 @@
 
 #include "llvm/Transforms/Instrumentation/Arbalest.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -40,6 +44,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 using namespace llvm;
 
@@ -91,10 +96,18 @@ static cl::opt<DedupeMode> ClDedupeMode(
                    "Dedup via MustAlias queries (precise, more expensive)")),
     cl::Hidden);
 
+static cl::opt<bool> ClArbalestHoist(
+    "arbalest-hoist", cl::init(true),
+    cl::desc("Hoist loop-invariant Arbalest range checks out of loops using "
+             "ScalarEvolution"),
+    cl::Hidden);
+
 STATISTIC(NumInstrumentedArbalestAccesses,
           "Number of load/store accesses Arbalest instrumented");
 STATISTIC(NumElidedArbalestAccesses,
           "Number of load/store accesses Arbalest elided by dedup");
+STATISTIC(NumHoistedArbalestLoops,
+          "Number of loops from which Arbalest hoisted range checks");
 
 namespace {
 
@@ -106,20 +119,32 @@ constexpr size_t kNumberOfAccessSizes = 5;
 
 class Arbalest {
 public:
-  explicit Arbalest(AAResults *AA = nullptr) : AA(AA) {}
+  explicit Arbalest(AAResults *AA = nullptr, LoopInfo *LI = nullptr,
+                    ScalarEvolution *SE = nullptr)
+      : AA(AA), LI(LI), SE(SE) {}
   bool sanitizeFunction(Function &F);
 
 private:
   void initialize(Module &M);
+  bool hoistLoopChecks(Function &F, DenseSet<Instruction *> &Hoisted);
   bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
   bool instrumentGEP(GetElementPtrInst *GEP, const DataLayout &DL);
 
   AAResults *AA;
+  LoopInfo *LI;
+  ScalarEvolution *SE;
   FunctionCallee ArbalestRead[kNumberOfAccessSizes];
   FunctionCallee ArbalestWrite[kNumberOfAccessSizes];
   FunctionCallee ArbalestUnalignedRead[kNumberOfAccessSizes];
   FunctionCallee ArbalestUnalignedWrite[kNumberOfAccessSizes];
   FunctionCallee ArbalestCheckBound;
+  // Loop-hoisted range/stride callbacks.
+  FunctionCallee ArbalestReadRange;
+  FunctionCallee ArbalestWriteRange;
+  FunctionCallee ArbalestReadStride;
+  FunctionCallee ArbalestWriteStride;
+  FunctionCallee ArbalestReadCStride;
+  FunctionCallee ArbalestWriteCStride;
   StringRef OutlinedFuncPrefix;
 };
 
@@ -301,7 +326,15 @@ PreservedAnalyses ArbalestPass::run(Function &F, FunctionAnalysisManager &FAM) {
   // modes don't pay the AA pipeline cost.
   AAResults *AA =
       (ClDedupeMode == DM_AA) ? &FAM.getResult<AAManager>(F) : nullptr;
-  Arbalest A(AA);
+  // LoopInfo and ScalarEvolution are needed for loop-hoisting. Always request
+  // them when hoisting is enabled; both are cheap if the function has no loops.
+  LoopInfo *LI = nullptr;
+  ScalarEvolution *SE = nullptr;
+  if (ClArbalestHoist) {
+    LI = &FAM.getResult<LoopAnalysis>(F);
+    SE = &FAM.getResult<ScalarEvolutionAnalysis>(F);
+  }
+  Arbalest A(AA, LI, SE);
   if (A.sanitizeFunction(F))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
@@ -349,6 +382,7 @@ static AccessState *findMustAliasState(
 }
 
 static void collectAccessesWithDedup(Function &F, AAResults *AA,
+                                     const DenseSet<Instruction *> &Hoisted,
                                      SmallVectorImpl<Instruction *> &Out) {
   // For value/strip modes we can use a hash map keyed on a Value*.
   DenseMap<Value *, AccessState> AddrState;
@@ -369,6 +403,8 @@ static void collectAccessesWithDedup(Function &F, AAResults *AA,
         continue;
       }
       if (!isa<LoadInst>(Inst) && !isa<StoreInst>(Inst))
+        continue;
+      if (Hoisted.count(&Inst))
         continue;
 
       const bool IsWrite = isa<StoreInst>(Inst);
@@ -427,11 +463,16 @@ bool Arbalest::sanitizeFunction(Function &F) {
   const DataLayout &DL = F.getParent()->getDataLayout();
   SmallVector<Instruction *, 16> AllLoadsAndStores;
 
+  // Phase 1: hoist range/stride checks out of loops where SCEV can prove the
+  // access pattern. Instructions placed in Hoisted are skipped by dedup.
+  DenseSet<Instruction *> Hoisted;
+  bool Res = hoistLoopChecks(F, Hoisted);
+
+  // Phase 2: per-element instrumentation for accesses not covered by hoisting.
   // All four dedup modes are handled inside collectAccessesWithDedup. DM_Off
   // simply emits every eligible access.
-  collectAccessesWithDedup(F, AA, AllLoadsAndStores);
+  collectAccessesWithDedup(F, AA, Hoisted, AllLoadsAndStores);
 
-  bool Res = false;
   for (auto *Inst : AllLoadsAndStores) {
     if (instrumentLoadOrStore(Inst, DL)) {
       Res = true;
@@ -449,6 +490,138 @@ bool Arbalest::sanitizeFunction(Function &F) {
   }
   return Res;
 }
+
+bool Arbalest::hoistLoopChecks(Function &F, DenseSet<Instruction *> &Hoisted) {
+  if (!LI || !SE || !ClArbalestHoist)
+    return false;
+
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  const Module *M = F.getParent();
+  LLVMContext &Ctx = F.getContext();
+  Type *I8PtrTy = Type::getInt8PtrTy(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+
+  bool Changed = false;
+
+  // Process innermost loops first so their hoists take precedence.
+  SmallVector<Loop *, 8> Loops = LI->getLoopsInPreorder();
+  for (Loop *L : reverse(Loops)) {
+    const SCEV *BTC = SE->getBackedgeTakenCount(L);
+    if (isa<SCEVCouldNotCompute>(BTC))
+      continue;
+
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader)
+      continue;
+
+    // One SCEVExpander per loop; it caches and reuses expanded values.
+    Instruction *InsertPt = Preheader->getTerminator();
+    SCEVExpander Exp(*SE, DL, "arbalest.hoist");
+
+    // Deduplicate: only emit one hoisted call per unique (start, step, rw).
+    using HoistKey = std::pair<const SCEV *, const SCEV *>;
+    DenseSet<HoistKey> SeenReads, SeenWrites;
+
+    bool LoopChanged = false;
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &Inst : *BB) {
+        if (!isa<LoadInst>(Inst) && !isa<StoreInst>(Inst))
+          continue;
+        if (Hoisted.count(&Inst))
+          continue;
+
+        const bool IsWrite = isa<StoreInst>(Inst);
+        Value *Addr = IsWrite ? cast<StoreInst>(&Inst)->getPointerOperand()
+                              : cast<LoadInst>(&Inst)->getPointerOperand();
+
+        if (!shouldInstrumentReadWriteFromAddress(M, Addr))
+          continue;
+        if (!IsWrite && addrPointsToConstantData(Addr))
+          continue;
+
+        const SCEV *PtrSCEV = SE->getSCEV(Addr);
+        const auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+        // Only hoist affine recurrences ({start,+,step}) in this exact loop.
+        if (!AR || AR->getLoop() != L || !AR->isAffine())
+          continue;
+
+        const SCEV *StartSCEV = AR->getStart();
+        const SCEV *StepSCEV = AR->getStepRecurrence(*SE);
+
+        // Skip non-positive (reverse / zero) strides.
+        if (const auto *CS = dyn_cast<SCEVConstant>(StepSCEV))
+          if (CS->getValue()->getValue().isNonPositive())
+            continue;
+
+        HoistKey Key{StartSCEV, StepSCEV};
+        auto &Seen = IsWrite ? SeenWrites : SeenReads;
+        if (!Seen.insert(Key).second) {
+          // Already emitted a hoisted call covering this range; just suppress
+          // the per-element callback.
+          Hoisted.insert(&Inst);
+          continue;
+        }
+
+        // Element size from the original access instruction.
+        Type *ElemTy = getLoadStoreType(&Inst);
+        if (!ElemTy->isSized())
+          continue;
+        uint64_t ElemBytes = DL.getTypeStoreSize(ElemTy).getFixedSize();
+
+        // --- Expand SCEV values into preheader IR ---
+        // start pointer
+        Value *StartV = Exp.expandCodeFor(StartSCEV, AR->getType(), InsertPt);
+
+        // step as i64 bytes
+        bool StepIsConst = isa<SCEVConstant>(StepSCEV);
+        int64_t ConstStepBytes = StepIsConst
+            ? cast<SCEVConstant>(StepSCEV)->getValue()->getSExtValue()
+            : 0;
+        Value *StepV = StepIsConst
+            ? ConstantInt::get(I64Ty, ConstStepBytes)
+            : Exp.expandCodeFor(StepSCEV, I64Ty, InsertPt);
+
+        // trip count = BTC + 1
+        const SCEV *TripCountSCEV =
+            SE->getAddExpr(BTC, SE->getConstant(BTC->getType(), 1));
+        Value *TripCountV = Exp.expandCodeFor(TripCountSCEV, I64Ty, InsertPt);
+
+        // Derive end pointer and emit the call using IRBuilder.
+        IRBuilder<> IRB(InsertPt);
+        Value *StartI8 = IRB.CreatePointerCast(StartV, I8PtrTy, "arbalest.start");
+        Value *ByteRange = IRB.CreateMul(StepV, TripCountV, "arbalest.range");
+        Value *EndI8 = IRB.CreateGEP(IRB.getInt8Ty(), StartI8, ByteRange,
+                                     "arbalest.end");
+        Value *ElemBytesV = ConstantInt::get(I64Ty, ElemBytes);
+
+        if (StepIsConst && ConstStepBytes == (int64_t)ElemBytes) {
+          // Unit stride: all accessed bytes are contiguous.
+          FunctionCallee Fn = IsWrite ? ArbalestWriteRange : ArbalestReadRange;
+          IRB.CreateCall(Fn, {StartI8, EndI8});
+        } else if (StepIsConst) {
+          FunctionCallee Fn =
+              IsWrite ? ArbalestWriteCStride : ArbalestReadCStride;
+          IRB.CreateCall(Fn, {StartI8, EndI8, StepV, ElemBytesV});
+        } else {
+          FunctionCallee Fn =
+              IsWrite ? ArbalestWriteStride : ArbalestReadStride;
+          IRB.CreateCall(Fn, {StartI8, EndI8, StepV, ElemBytesV});
+        }
+
+        Hoisted.insert(&Inst);
+        LoopChanged = true;
+      }
+    }
+
+    if (LoopChanged) {
+      ++NumHoistedArbalestLoops;
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+
 
 void Arbalest::initialize(Module &M) {
   IRBuilder<> IRB(M.getContext());
@@ -483,6 +656,22 @@ void Arbalest::initialize(Module &M) {
   ArbalestCheckBound = M.getOrInsertFunction(
       "__arbalest_check_bound", Attr, IRB.getVoidTy(), IRB.getInt8PtrTy(),
       IRB.getInt8PtrTy(), IRB.getInt32Ty());
+
+  // Loop-hoisted range/stride callbacks.
+  Type *I8PtrTy = IRB.getInt8PtrTy();
+  Type *I64Ty = IRB.getInt64Ty();
+  ArbalestReadRange = M.getOrInsertFunction("__arbalest_read_range", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy);
+  ArbalestWriteRange = M.getOrInsertFunction("__arbalest_write_range", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy);
+  ArbalestReadStride = M.getOrInsertFunction("__arbalest_read_stride", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy, I64Ty, I64Ty);
+  ArbalestWriteStride = M.getOrInsertFunction("__arbalest_write_stride", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy, I64Ty, I64Ty);
+  ArbalestReadCStride = M.getOrInsertFunction("__arbalest_read_cstride", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy, I64Ty, I64Ty);
+  ArbalestWriteCStride = M.getOrInsertFunction("__arbalest_write_cstride", Attr,
+      IRB.getVoidTy(), I8PtrTy, I8PtrTy, I64Ty, I64Ty);
 }
 
 bool Arbalest::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {

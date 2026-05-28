@@ -95,3 +95,98 @@ void __arbalest_unaligned_write16(void *addr) {
 void __arbalest_check_bound(void *base, void *start, unsigned size) {
   CheckBound(cur_thread(), CALLERPC, (uptr)base, (uptr)start, size);
 }
+
+// --- Loop-hoisted range/stride callbacks ---
+//
+// These are emitted by the Arbalest pass when SCEV analysis proves that a
+// loop body accesses memory in a predictable linear pattern, allowing the
+// per-element callbacks to be replaced with a single pre-loop call.
+//
+// Naming convention:
+//   _range   : contiguous [start, end) — step == elem_size (unit stride)
+//   _stride  : strided [start, end) step bytes apart — step unknown at compile time
+//   _cstride : same, but step is a compile-time constant (enables SIMD specialization)
+//
+// For _stride and _cstride, elem_bytes is the size of each individual access
+// (may be smaller than step for non-unit strides, e.g. int in a double-stride loop).
+
+// --- helpers (file-local) ---
+
+static void CheckVsmStridedRange(ThreadState *thr, uptr pc, uptr start,
+                                  uptr end, uptr step, uptr elem_bytes) {
+  for (uptr addr = start; addr < end; addr += step) {
+    if (elem_bytes <= kVsmCell) {
+      if (UNLIKELY(CheckVsm(thr, pc, addr, elem_bytes)))
+        return;
+    } else {
+      CheckVsmForMemoryRange(thr, pc, addr, elem_bytes);
+    }
+  }
+}
+
+static void UpdateVsmStridedRange(ThreadState *thr, uptr start, uptr end,
+                                   uptr step, uptr elem_bytes) {
+  for (uptr addr = start; addr < end; addr += step) {
+    if (elem_bytes <= kVsmCell)
+      UpdateVsm(thr, addr, elem_bytes);
+    else
+      UpdateVsmForMemoryRange(thr, addr, elem_bytes);
+  }
+}
+
+// --- contiguous range ---
+
+void __arbalest_read_range(void *start, void *end) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  CheckVsmForMemoryRange(cur_thread(), CALLERPC, s, e - s);
+}
+
+void __arbalest_write_range(void *start, void *end) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  UpdateVsmForMemoryRange(cur_thread(), s, e - s);
+}
+
+// --- dynamic stride ---
+
+void __arbalest_read_stride(void *start, void *end, uptr step, uptr elem_bytes) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  CheckVsmStridedRange(cur_thread(), CALLERPC, s, e, step, elem_bytes);
+}
+
+void __arbalest_write_stride(void *start, void *end, uptr step, uptr elem_bytes) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  UpdateVsmStridedRange(cur_thread(), s, e, step, elem_bytes);
+}
+
+// --- constant stride (SIMD specializations for step == 16) ---
+
+void __arbalest_read_cstride(void *start, void *end, uptr step, uptr elem_bytes) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  ThreadState *thr = cur_thread();
+  // step==16 && elem==16: each element fills one SSE2 word; use CheckVsm16.
+  if (step == 16 && elem_bytes == 16) {
+    for (uptr addr = s; addr < e; addr += 16)
+      if (UNLIKELY(CheckVsm16(thr, CALLERPC, addr)))
+        return;
+    return;
+  }
+  CheckVsmStridedRange(thr, CALLERPC, s, e, step, elem_bytes);
+}
+
+void __arbalest_write_cstride(void *start, void *end, uptr step, uptr elem_bytes) {
+  uptr s = (uptr)start, e = (uptr)end;
+  if (LIKELY(s >= e)) return;
+  ThreadState *thr = cur_thread();
+  // step==16 && elem==16: use UpdateVsm16 (SSE2 _mm_storeu_si128 path).
+  if (step == 16 && elem_bytes == 16) {
+    for (uptr addr = s; addr < e; addr += 16)
+      UpdateVsm16(thr, addr);
+    return;
+  }
+  UpdateVsmStridedRange(thr, s, e, step, elem_bytes);
+}

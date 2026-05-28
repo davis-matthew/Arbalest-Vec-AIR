@@ -23,28 +23,28 @@ entry:
 
 ; An OpenMP outlined function with a GEP-based load should get BOTH
 ; __arbalest_read and __arbalest_check_bound.
-define void @".omp_outlined."(i32* %arr, i64 %idx) {
+define void @.omp_outlined.(i32* %arr, i64 %idx) {
 entry:
   %gep = getelementptr i32, i32* %arr, i64 %idx
   %val = load i32, i32* %gep, align 4
   ret void
 }
 
-; CHECK-LABEL: define void @".omp_outlined."
+; CHECK-LABEL: define void @.omp_outlined.
 ; CHECK:         call void @__arbalest_read4
 ; CHECK:         call void @__arbalest_check_bound(i8* {{.*}}, i8* {{.*}}, i32 4)
 ; CHECK:         %val = load i32, i32* %gep, align 4
 
 ; A store through a GEP in an outlined function gets __arbalest_write but no
 ; check_bound (check_bound is only for loads through GEPs).
-define void @".omp_outlined._store"(i32* %arr, i64 %idx) {
+define void @.omp_outlined._store(i32* %arr, i64 %idx) {
 entry:
   %gep = getelementptr i32, i32* %arr, i64 %idx
   store i32 42, i32* %gep, align 4
   ret void
 }
 
-; CHECK-LABEL: define void @".omp_outlined._store"
+; CHECK-LABEL: define void @.omp_outlined._store
 ; CHECK:         call void @__arbalest_write4
 ; CHECK-NOT:     call void @__arbalest_check_bound
 ; CHECK:         store i32 42, i32* %gep, align 4
