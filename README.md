@@ -107,6 +107,139 @@ For example:
    opt -passes='tsan-module,function(tsan),arbalest-module,function(arbalest)' -arbalest=1 input.ll -o output.bc
 ```
 
+### Selective instrumentation: function include lists
+
+By default Arbalest instruments every eligible function in the module. Two
+mechanisms allow you to restrict instrumentation to a subset of functions,
+which reduces runtime overhead and focuses the detector's budget on the code
+most likely to contain data-inconsistency bugs.
+
+#### Explicit include list (`-arbalest-only-functions`)
+
+Pass a comma-separated list of function names. Only those functions receive
+`__arbalest_*` callbacks; every other function is skipped entirely.
+
+```bash
+clang++ ... -farbalest -fsanitize=thread \
+    -mllvm -arbalest-only-functions=bad_kernel,helper_fn \
+    example.cpp
+```
+
+This is the low-level primitive. The OMPSan integration below generates this
+list automatically.
+
+#### OMPSan-guided selective instrumentation (`-arbalest-ompsan`)
+
+[OMPSan](llvm/lib/Transforms/Instrumentation/OMPSan/) is a static analysis
+that inspects OpenMP runtime calls in the host IR and identifies functions
+involved in potential data-mapping inconsistencies — variables sent to the
+device with `map(to:)` but never returned with `map(from:)` or `map(tofrom:)`.
+
+When `-arbalest-ompsan` is enabled:
+
+1. **OMPSan analysis** runs as a module-level prerequisite of `arbalest-module`.
+   It walks `__tgt_target_data_begin_mapper` / `__tgt_target_data_end_mapper`
+   calls, extracts the map-type bits for each argument, and flags any variable
+   that is copied host → device (`to:`) but never copied back (`from:`).
+
+2. **Include list** is built from the set of functions that contain those
+   suspect mapping calls.  Currently this is a conservative over-approximation
+   (true + false positives); the Arbalest runtime then acts as the arbiter at
+   execution time.
+
+3. **Arbalest** instruments only the flagged functions, leaving pure host-only
+   code uninstrumented.
+
+```bash
+# Compile with OMPSan-guided instrumentation:
+clang++ -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu \
+        -farbalest -fsanitize=thread \
+        -mllvm -arbalest-ompsan=1 \
+        example.cpp -o example.exe
+```
+
+Both flags can be combined — OMPSan's list and the explicit list are unioned,
+so any function in either list is instrumented:
+
+```bash
+   -mllvm -arbalest-ompsan=1 -mllvm -arbalest-only-functions=extra_fn
+```
+
+#### OMPSan output files
+
+Every compilation with `-arbalest-ompsan=1` writes two files to `$HOME`:
+
+| File | Contents |
+|---|---|
+| `~/OMPSanReport.txt` | One line per detected bug with a human-readable description of the missing map clause |
+| `~/OMPSanAllowlist.txt` | Sanitizer allowlist format (`fun:<name>`) — one entry per function Arbalest was asked to instrument |
+
+#### Ablation study with OMPSan
+
+The `arbalest_ablation.sh` script accepts `--ompsan` to re-run every
+dedup × hoist configuration with OMPSan enabled and report the reduction in
+instrumented call sites:
+
+```bash
+./arbalest_ablation.sh --ompsan --no-run \
+    --cflags "-I$BUILD/projects/openmp/runtime/src" \
+    my_program.c
+```
+
+The extra **OMPSan Impact** table in the report shows, for each configuration:
+
+| Column | Meaning |
+|---|---|
+| `before` | total `__arbalest_*` call sites without OMPSan filtering |
+| `after`  | call sites retained after OMPSan restricts the include list |
+| `removed` | call sites eliminated |
+| `saved%` | reduction percentage (green = fewer calls, red = more) |
+
+#### Running OMPSan standalone via `opt`
+
+The four OMPSan analysis passes and their printer counterparts are all
+registered with the LLVM pass manager:
+
+| Pass name | Type | Description |
+|---|---|---|
+| `mem-use-def` | Module analysis | Interprocedural memory use-def chain analysis |
+| `omp-diagnostics` | Module analysis | OpenMP RTL call parser; builds host↔device copy maps |
+| `omp-sanitizer` | Module analysis | Cross-boundary bug detector; produces the include list |
+| `omp-optimem` | Module analysis | Memory-mapping optimisation analysis (experimental) |
+| `omp-mem-def-print` | Module pass | Printer for `mem-use-def` results |
+| `omp-diagnostics-print` | Module pass | Printer for `omp-diagnostics` results |
+| `omp-sanitizer-print` | Module pass | Printer for `omp-sanitizer` results |
+
+The analyses run lazily — requesting `omp-sanitizer` automatically triggers
+`omp-diagnostics` and `mem-use-def`. Arbalest does this internally when
+`-arbalest-ompsan=1` is set, so you do not need to list them explicitly in a
+`-passes=` string.
+
+#### Implementation notes and known limitations
+
+**LLVM ≥14 device-code visibility.** In LLVM ≥14 the device kernel is
+compiled into a separate object and is not present in the host IR that OMPSan
+analyses. The original OMPSan reaching-definition analysis relied on seeing
+`__omp_offloading_*` function definitions in the host module (as was the case
+in LLVM ≤13). For LLVM 15 a **map-type fallback** was added: rather than
+tracing def/use chains across the host/device boundary, it inspects the
+`map(to:)` / `map(from:)` flags on every `__tgt_target_data_begin_mapper`
+call and flags functions where a variable leaves for the device but is never
+returned. This catches the same class of bugs with no false negatives, at the
+cost of potential false positives (variables intentionally mapped `to:`
+without needing a readback).
+
+**Conservative include list.** OMPSan reports both true and false positives.
+Arbalest instruments all flagged functions; the runtime's happens-before
+tracking then determines which accesses are actual inconsistencies. False
+positives add instrumentation overhead but do not produce spurious warnings.
+
+**Mapper API alignment.** The pass recognises both the legacy
+`__tgt_target_data_begin` API (LLVM ≤13) and the mapper variant
+`__tgt_target_data_begin_mapper` (LLVM ≥14). The argument-position table
+in `OmpDiagnosticsAnalysis.h` (`TargetRTLMap`) encodes the positional
+differences between the two calling conventions.
+
 ### Execute the OpenMP program
 ```c
    export TSAN_OPTIONS='ignore_noninstrumented_modules=1' // this option is needed to avoid false positives
