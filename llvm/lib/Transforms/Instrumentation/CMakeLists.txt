@@ -20,6 +20,12 @@ add_llvm_component_library(LLVMInstrumentation
   ThreadSanitizer.cpp
   HWAddressSanitizer.cpp
 
+  # OMPSan & OMPMemOpt static analysis passes (used by Arbalest --arbalest-ompsan)
+  OMPSan/MemUseDefAnalysis.cpp
+  OMPSan/OmpDiagnosticsAnalysis.cpp
+  OMPSan/OmpSanitizer.cpp
+  OMPSan/OmpOptiMem.cpp
+
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
 

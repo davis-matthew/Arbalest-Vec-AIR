@@ -12,6 +12,9 @@
 # Options:
 #   --no-color       Disable ANSI color output
 #   --no-run         Skip binary compilation and execution (implied for .ll)
+#   --ompsan         Also run each config with -arbalest-ompsan and report the
+#                    reduction in instrumented call sites (before vs after
+#                    OMPSan static analysis guidance).
 #   --out-dir DIR    Directory to write IRs (default: <stem>.arbalest_ablation)
 #   --cflags "..."   Extra flags forwarded to every clang invocation.
 #                    Use this to supply headers, link paths, etc. that your
@@ -26,6 +29,11 @@
 #   [3] dedup:value    value × false  — value-identity dedup, no hoist
 #   [4] hoist+strip    strip × true   — both: hoist first, dedup residual
 #   [5] hoist+value    value × true   — both: hoist first, dedup residual
+#
+# With --ompsan, each config above is re-run with -arbalest-ompsan=1, which
+# routes the OMPSan data-mapping analysis first.  Only functions flagged by
+# OMPSan (true + false positives) are instrumented.  The final "OMPSan Impact"
+# table shows the change in call-site count for every dedup×hoist pair.
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=/scratch/mdavis/arbalest-build
@@ -37,6 +45,7 @@ OMP_INC=$BUILD/projects/openmp/runtime/src   # omp.h from the in-tree OpenMP bui
 # ── args ──────────────────────────────────────────────────────────────────────
 USE_COLOR=true
 NO_RUN=false
+RUN_OMPSAN=false
 OUT_DIR=""
 EXTRA_CFLAGS=""
 
@@ -44,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-color)         USE_COLOR=false; shift ;;
         --no-run)           NO_RUN=true;     shift ;;
+        --ompsan)           RUN_OMPSAN=true;  shift ;;
         --out-dir)          OUT_DIR="$2";    shift 2 ;;
         --out-dir=*)        OUT_DIR="${1#*=}"; shift ;;
         --cflags)           EXTRA_CFLAGS="$2"; shift 2 ;;
@@ -116,15 +126,23 @@ HT_TYPES=(read_range write_range read_cstride write_cstride read_stride write_st
 
 # ── IR generation ─────────────────────────────────────────────────────────────
 # Writes IR to stdout; stderr goes to the per-config log file (set by caller).
+# $4 (ompsan): if "true", add -arbalest-ompsan=1 so that only functions flagged
+#              by the OMPSan data-mapping analysis are instrumented.
 emit_ir() {
-    local dedupe="$1" hoist="$2" logfile="${3:-/dev/null}"
+    local dedupe="$1" hoist="$2" logfile="${3:-/dev/null}" ompsan="${4:-false}"
+    local ompsan_flag=()
+    $ompsan && ompsan_flag=(-arbalest-ompsan=1)
+
     if [[ "$EXT" == "ll" ]]; then
         $OPT < "$INPUT" -passes="$PASSES_FUNC" \
             -arbalest=1 \
             -arbalest-dedupe-mode="$dedupe" \
             -arbalest-hoist="$hoist" \
+            "${ompsan_flag[@]}" \
             -S 2>"$logfile"
     else
+        local mllvm_ompsan=()
+        $ompsan && mllvm_ompsan=(-mllvm -arbalest-ompsan=1)
         # shellcheck disable=SC2086
         $CLANG -target x86_64-unknown-linux-gnu \
             -fsanitize=thread -fopenmp \
@@ -135,6 +153,7 @@ emit_ir() {
             $EXTRA_CFLAGS \
             -mllvm -arbalest-dedupe-mode="$dedupe" \
             -mllvm -arbalest-hoist="$hoist" \
+            "${mllvm_ompsan[@]}" \
             -S -emit-llvm "$INPUT" -o - 2>"$logfile"
     fi
 }
@@ -172,6 +191,14 @@ declare -a VIOLATIONS   # captured stderr from binary run per config
 declare -A PE_CNT       # PE_CNT[ci,type] — aligned per-element by type
 declare -A UA_CNT       # UA_CNT[ci,type] — unaligned per-element by type
 declare -A HT_CNT       # HT_CNT[ci,type] — hoisted by type
+
+# OMPSan-guided variants (populated only when --ompsan is set)
+declare -a OS_IR_FILE   # path to saved OMPSan-guided IR per config
+declare -a OS_IR_MS     # ms to generate OMPSan-guided IR per config
+declare -a OS_PE_TOTAL  # per-element aligned calls in OMPSan-guided IR
+declare -a OS_UA_TOTAL  # per-element unaligned calls in OMPSan-guided IR
+declare -a OS_HT_TOTAL  # hoisted calls in OMPSan-guided IR
+declare -a OS_OK        # "ok" or "fail" — whether IR generation succeeded
 
 for (( ci=0; ci<NC; ci++ )); do
     slug=$(cfg_slug  $ci)
@@ -266,6 +293,68 @@ for (( ci=0; ci<NC; ci++ )); do
     fi
 done
 printf '\n'
+
+# ── OMPSan-guided data collection ─────────────────────────────────────────────
+# Re-run each dedup×hoist config with -arbalest-ompsan=1.  OMPSan runs as a
+# module analysis before Arbalest and restricts instrumentation to functions it
+# identifies as data-mapping suspects (true + false positives).
+if $RUN_OMPSAN; then
+    printf 'Collecting OMPSan-guided data (--ompsan mode)\n\n'
+    for (( ci=0; ci<NC; ci++ )); do
+        slug=$(cfg_slug  $ci)
+        dedupe=$(cfg_dedupe $ci)
+        hoist=$(cfg_hoist  $ci)
+
+        os_ir_path="$OUT_DIR/cfg${ci}_${slug}_ompsan.ll"
+        os_ir_log="$OUT_DIR/cfg${ci}_${slug}_ompsan.log"
+        OS_IR_FILE[$ci]="$os_ir_path"
+
+        printf '  [%d] %-45s +OMPSan ... ' "$ci" "$(cfg_label $ci)"
+
+        t0=$(ms_now)
+        emit_ir "$dedupe" "$hoist" "$os_ir_log" "true" > "$os_ir_path"
+        os_ok=$?
+        t1=$(ms_now)
+        OS_IR_MS[$ci]=$(( t1 - t0 ))
+
+        if [[ $os_ok -ne 0 || ! -s "$os_ir_path" ]]; then
+            OS_OK[$ci]="fail"
+            OS_PE_TOTAL[$ci]=0
+            OS_UA_TOTAL[$ci]=0
+            OS_HT_TOTAL[$ci]=0
+            printf 'FAILED (see %s)\n' "$os_ir_log"
+            if [[ -s "$os_ir_log" ]]; then
+                head -3 "$os_ir_log" | sed 's/^/    /' >&2
+            fi
+            continue
+        fi
+        OS_OK[$ci]="ok"
+
+        os_pe=0
+        for typ in "${PE_TYPES[@]}"; do
+            n=$(count_type "$os_ir_path" "$typ")
+            os_pe=$(( os_pe + ${n:-0} ))
+        done
+        OS_PE_TOTAL[$ci]=$os_pe
+
+        os_ua=0
+        for typ in "${UA_TYPES[@]}"; do
+            n=$(count_type "$os_ir_path" "$typ")
+            os_ua=$(( os_ua + ${n:-0} ))
+        done
+        OS_UA_TOTAL[$ci]=$os_ua
+
+        os_ht=0
+        for typ in "${HT_TYPES[@]}"; do
+            n=$(count_type "$os_ir_path" "$typ")
+            os_ht=$(( os_ht + ${n:-0} ))
+        done
+        OS_HT_TOTAL[$ci]=$os_ht
+
+        printf 'IR(%dms)\n' "${OS_IR_MS[$ci]}"
+    done
+    printf '\n'
+fi
 
 # ── summary table ─────────────────────────────────────────────────────────────
 BASE_PE=${PE_TOTAL[0]}
@@ -479,4 +568,93 @@ else
 fi
 
 printf '\n'
+
+# ── OMPSan impact table ────────────────────────────────────────────────────────
+if $RUN_OMPSAN; then
+    bold '── OMPSan Impact: before vs after static analysis guidance ─────────────'
+    printf '\n'
+    printf '  OMPSan pre-screens OpenMP data-mapping and flags suspect functions.\n'
+    printf '  "before" = full Arbalest instrumentation for that dedup×hoist config.\n'
+    printf '  "after"  = same config with -arbalest-ompsan: only flagged functions\n'
+    printf '             are instrumented (true + false positives from OMPSan).\n'
+    printf '  Columns: total = pe + unaligned + hoisted call sites in the IR.\n'
+    printf '\n'
+
+    # Header
+    printf '  %-*s  %10s  %10s  %10s  %8s\n' \
+        $LW "configuration" "before" "after" "removed" "saved%"
+    printf '  %s\n' "$SEP"
+
+    for (( ci=0; ci<NC; ci++ )); do
+        before_total=$(( PE_TOTAL[$ci] + UA_TOTAL[$ci] + HT_TOTAL[$ci] ))
+
+        if [[ "${OS_OK[$ci]:-fail}" != "ok" ]]; then
+            printf '  %-*s  %10d  %10s  %10s  %8s\n' \
+                $LW "[$ci] $(cfg_label $ci)" \
+                "$before_total" "N/A (failed)" "" ""
+            continue
+        fi
+
+        after_total=$(( OS_PE_TOTAL[$ci] + OS_UA_TOTAL[$ci] + OS_HT_TOTAL[$ci] ))
+        removed=$(( before_total - after_total ))
+
+        if [[ $before_total -gt 0 ]]; then
+            saved_pct=$(( removed * 100 / before_total ))
+        else
+            saved_pct=0
+        fi
+
+        # Colour the saved% green when positive, red when negative (more calls)
+        if [[ $removed -gt 0 ]]; then
+            pct_str="$(green "${saved_pct}%")"
+        elif [[ $removed -lt 0 ]]; then
+            pct_str="$(red "${saved_pct}%")"
+        else
+            pct_str="${saved_pct}%"
+        fi
+
+        printf '  %-*s  %10d  %10d  %10d  %8s\n' \
+            $LW "[$ci] $(cfg_label $ci)" \
+            "$before_total" "$after_total" "$removed" "$pct_str"
+    done
+    printf '\n'
+
+    # Per-category breakdown (pe / unaligned / hoisted separately)
+    bold '── OMPSan Impact: per-category breakdown ───────────────────────────────'
+    printf '\n'
+    printf '  %-*s  %6s %6s  %6s %6s  %6s %6s\n' \
+        $LW "configuration" \
+        "pe-b" "pe-a" "ua-b" "ua-a" "ht-b" "ht-a"
+    printf '  %-*s  %13s  %13s  %13s\n' \
+        $LW "" \
+        "(per-element aligned)" "(unaligned)" "(hoisted)"
+    printf '  %s\n' "$SEP"
+
+    for (( ci=0; ci<NC; ci++ )); do
+        if [[ "${OS_OK[$ci]:-fail}" != "ok" ]]; then
+            printf '  %-*s  %6d %6s  %6d %6s  %6d %6s\n' \
+                $LW "[$ci] $(cfg_label $ci)" \
+                "${PE_TOTAL[$ci]}" "N/A" \
+                "${UA_TOTAL[$ci]}" "N/A" \
+                "${HT_TOTAL[$ci]}" "N/A"
+        else
+            printf '  %-*s  %6d %6d  %6d %6d  %6d %6d\n' \
+                $LW "[$ci] $(cfg_label $ci)" \
+                "${PE_TOTAL[$ci]}"    "${OS_PE_TOTAL[$ci]}" \
+                "${UA_TOTAL[$ci]}"    "${OS_UA_TOTAL[$ci]}" \
+                "${HT_TOTAL[$ci]}"    "${OS_HT_TOTAL[$ci]}"
+        fi
+    done
+    printf '\n'
+
+    # List OMPSan-guided IR files
+    bold '── OMPSan-guided IRs ───────────────────────────────────────────────────'
+    for (( ci=0; ci<NC; ci++ )); do
+        status="[${OS_OK[$ci]:-fail}]"
+        printf '  [%d] %-6s  %s  (%dms)\n' \
+            "$ci" "$status" "${OS_IR_FILE[$ci]}" "${OS_IR_MS[$ci]:-0}"
+    done
+    printf '\n'
+fi
+
 bold '════════════════════════════════════════════════════════════════════════'

@@ -15,9 +15,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Instrumentation/Arbalest.h"
+#include "llvm/Transforms/Instrumentation/OMPSan/OmpSanitizer.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
@@ -100,6 +102,26 @@ static cl::opt<bool> ClArbalestHoist(
     "arbalest-hoist", cl::init(true),
     cl::desc("Hoist loop-invariant Arbalest range checks out of loops using "
              "ScalarEvolution"),
+    cl::Hidden);
+
+// When non-empty, only functions whose names appear in this list are
+// instrumented. This is an explicit include/allowlist: every function not
+// named here is skipped entirely. Complements the per-attribute
+// DisableSanitizerInstrumentation exclude mechanism.
+static cl::list<std::string> ClArbalestIncludeFunctions(
+    "arbalest-only-functions",
+    cl::desc("Comma-separated list of function names Arbalest should "
+             "instrument (empty = instrument all eligible functions)"),
+    cl::Hidden, cl::CommaSeparated);
+
+// When true, run the OMPSan data-mapping analysis before instrumentation and
+// use its reported suspect functions as the include list.  OMPSan will flag
+// both true and false positives; Arbalest then instruments only those
+// functions so that the runtime can produce a precise verdict.
+static cl::opt<bool> ClArbalestOMPSan(
+    "arbalest-ompsan", cl::init(false),
+    cl::desc("Run OMPSan analysis and restrict Arbalest instrumentation to "
+             "the functions OMPSan identifies as data-mapping suspects"),
     cl::Hidden);
 
 STATISTIC(NumInstrumentedArbalestAccesses,
@@ -309,13 +331,30 @@ void setOmpOutlinedFuncPrefix(Module &M) {
                                 UseOptPrefix ? OptPrefix : DebugPrefix));
 }
 
+// Populated by ModuleArbalestPass when ClArbalestOMPSan is active.
+// ArbalestPass (a function pass) reads this to decide which functions to
+// instrument.  Strings are owned by this set.
+static StringSet<> ArbalestOMPSanIncludeFuncs;
+
 } // namespace
 
-PreservedAnalyses ModuleArbalestPass::run(Module &M, ModuleAnalysisManager &) {
+PreservedAnalyses ModuleArbalestPass::run(Module &M, ModuleAnalysisManager &AM) {
   if (!ClEnableArbalest)
     return PreservedAnalyses::all();
   insertArbalestCtor(M);
   setOmpOutlinedFuncPrefix(M);
+
+  // When OMPSan mode is active, run the OmpSanitizerGlobalAnalysis and
+  // collect the set of functions it flags as data-mapping suspects.  These
+  // become Arbalest's include list for this module; ArbalestPass (the per-
+  // function pass that follows) will skip any function not in the set.
+  if (ClArbalestOMPSan) {
+    ArbalestOMPSanIncludeFuncs.clear();
+    auto &SanInfo = AM.getResult<OmpSanitizerGlobalAnalysis>(M);
+    for (auto &Entry : SanInfo.getIncludeList())
+      ArbalestOMPSanIncludeFuncs.insert(Entry.first);
+  }
+
   return PreservedAnalyses::none();
 }
 
@@ -457,6 +496,28 @@ bool Arbalest::sanitizeFunction(Function &F) {
     return false;
   if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
     return false;
+
+  // Include-list filtering: if at least one include list is active, only
+  // instrument functions that appear in at least one of them (union).
+  // -arbalest-only-functions provides a user-specified explicit list;
+  // -arbalest-ompsan provides a list derived from the OMPSan analysis.
+  if (!ClArbalestIncludeFunctions.empty() || ClArbalestOMPSan) {
+    bool Allowed = false;
+    // Check OMPSan-derived list first (populated by ModuleArbalestPass).
+    if (ClArbalestOMPSan && ArbalestOMPSanIncludeFuncs.count(F.getName()))
+      Allowed = true;
+    // Check user-supplied include list.
+    if (!Allowed) {
+      for (const std::string &Name : ClArbalestIncludeFunctions) {
+        if (F.getName() == Name) {
+          Allowed = true;
+          break;
+        }
+      }
+    }
+    if (!Allowed)
+      return false;
+  }
 
   initialize(*F.getParent());
 

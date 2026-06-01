@@ -28,6 +28,14 @@ MODULE_ANALYSIS("verify", VerifierAnalysis())
 MODULE_ANALYSIS("pass-instrumentation", PassInstrumentationAnalysis(PIC))
 MODULE_ANALYSIS("inline-advisor", InlineAdvisorAnalysis())
 MODULE_ANALYSIS("ir-similarity", IRSimilarityAnalysis())
+// OMPSan analyses: data-mapping reaching-definition chain required by Arbalest
+// --arbalest-ompsan mode.  Registration order matters: MemUseDefGlobalAnalysis
+// and OmpDiagnosticsGlobalAnalysis must be registered before
+// OmpSanitizerGlobalAnalysis so the AM can resolve their results lazily.
+MODULE_ANALYSIS("mem-use-def", MemUseDefGlobalAnalysis())
+MODULE_ANALYSIS("omp-diagnostics", OmpDiagnosticsGlobalAnalysis())
+MODULE_ANALYSIS("omp-sanitizer", OmpSanitizerGlobalAnalysis())
+MODULE_ANALYSIS("omp-optimem", OmpOptiMemGlobalAnalysis())
 
 #ifndef MODULE_ALIAS_ANALYSIS
 #define MODULE_ALIAS_ANALYSIS(NAME, CREATE_PASS)                               \
@@ -123,6 +131,10 @@ MODULE_PASS("msan-module", ModuleMemorySanitizerPass({}))
 MODULE_PASS("module-inline", ModuleInlinerPass())
 MODULE_PASS("tsan-module", ModuleThreadSanitizerPass())
 MODULE_PASS("arbalest-module", ModuleArbalestPass())
+MODULE_PASS("omp-sanitizer-print", OmpSanitizerGlobalPrinterPass(dbgs()))
+MODULE_PASS("omp-mem-def-print", MemUseDefGlobalAnalysisPrinterPass(dbgs()))
+MODULE_PASS("omp-diagnostics-print", OmpDiagnosticsGlobalPrinterPass(dbgs()))
+MODULE_PASS("omp-optimem-print", OmpOptiMemGlobalPrinterPass(dbgs()))
 MODULE_PASS("sancov-module", ModuleSanitizerCoveragePass())
 MODULE_PASS("memprof-module", ModuleMemProfilerPass())
 MODULE_PASS("poison-checking", PoisonCheckingPass())
