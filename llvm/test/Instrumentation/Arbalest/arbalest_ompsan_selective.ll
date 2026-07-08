@@ -84,3 +84,20 @@ loop:
 exit:
   ret double %acc.next
 }
+
+; ── excluded_outlined ───────────────────────────────────────────────────────
+; An OpenMP-outlined function that is NOT in the include list. The include
+; list only vouches for skipping read/write race checks (that's all OMPSan
+; reasons about); it must not suppress unrelated instrumentation such as the
+; GEP bound check, which still must be inserted here.
+;
+; CHECK-LABEL: define void @.omp_outlined.excluded
+; CHECK-NOT:     call void @__arbalest_read
+; CHECK-NOT:     call void @__arbalest_write
+; CHECK:         call void @__arbalest_check_bound
+define void @.omp_outlined.excluded(i32* %arr, i64 %idx) {
+entry:
+  %gep = getelementptr i32, i32* %arr, i64 %idx
+  %val = load i32, i32* %gep, align 4
+  ret void
+}

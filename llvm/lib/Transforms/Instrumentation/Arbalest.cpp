@@ -332,8 +332,8 @@ void setOmpOutlinedFuncPrefix(Module &M) {
 }
 
 // Populated by ModuleArbalestPass when ClArbalestOMPSan is active.
-// ArbalestPass (a function pass) reads this to decide which functions to
-// instrument.  Strings are owned by this set.
+// ArbalestPass (a function pass) reads this to decide which functions get
+// read/write race instrumentation. Strings are owned by this set.
 static StringSet<> ArbalestOMPSanIncludeFuncs;
 
 } // namespace
@@ -347,7 +347,10 @@ PreservedAnalyses ModuleArbalestPass::run(Module &M, ModuleAnalysisManager &AM) 
   // When OMPSan mode is active, run the OmpSanitizerGlobalAnalysis and
   // collect the set of functions it flags as data-mapping suspects.  These
   // become Arbalest's include list for this module; ArbalestPass (the per-
-  // function pass that follows) will skip any function not in the set.
+  // function pass that follows) will skip read/write race instrumentation
+  // for any function not in the set. Other instrumentation kinds (e.g. GEP
+  // bound checks) are unaffected, since OMPSan only reasons about
+  // read/write data races.
   if (ClArbalestOMPSan) {
     ArbalestOMPSanIncludeFuncs.clear();
     auto &SanInfo = AM.getResult<OmpSanitizerGlobalAnalysis>(M);
@@ -498,9 +501,15 @@ bool Arbalest::sanitizeFunction(Function &F) {
     return false;
 
   // Include-list filtering: if at least one include list is active, only
-  // instrument functions that appear in at least one of them (union).
-  // -arbalest-only-functions provides a user-specified explicit list;
-  // -arbalest-ompsan provides a list derived from the OMPSan analysis.
+  // run the read/write memory-access instrumentation (loop-hoisted checks
+  // and per-instruction load/store checks) on functions that appear in at
+  // least one of them (union). -arbalest-only-functions provides a
+  // user-specified explicit list; -arbalest-ompsan provides a list derived
+  // from the OMPSan analysis. This gate must never suppress other kinds of
+  // instrumentation (e.g. the GEP/OpenMP bound checks below) -- OMPSan only
+  // reasons about read/write data races, so it has no basis to vouch for
+  // skipping unrelated checks.
+  bool SkipReadWriteChecks = false;
   if (!ClArbalestIncludeFunctions.empty() || ClArbalestOMPSan) {
     bool Allowed = false;
     // Check OMPSan-derived list first (populated by ModuleArbalestPass).
@@ -515,29 +524,33 @@ bool Arbalest::sanitizeFunction(Function &F) {
         }
       }
     }
-    if (!Allowed)
-      return false;
+    SkipReadWriteChecks = !Allowed;
   }
 
   initialize(*F.getParent());
 
   const DataLayout &DL = F.getParent()->getDataLayout();
-  SmallVector<Instruction *, 16> AllLoadsAndStores;
+  bool Res = false;
 
-  // Phase 1: hoist range/stride checks out of loops where SCEV can prove the
-  // access pattern. Instructions placed in Hoisted are skipped by dedup.
-  DenseSet<Instruction *> Hoisted;
-  bool Res = hoistLoopChecks(F, Hoisted);
+  if (!SkipReadWriteChecks) {
+    SmallVector<Instruction *, 16> AllLoadsAndStores;
 
-  // Phase 2: per-element instrumentation for accesses not covered by hoisting.
-  // All four dedup modes are handled inside collectAccessesWithDedup. DM_Off
-  // simply emits every eligible access.
-  collectAccessesWithDedup(F, AA, Hoisted, AllLoadsAndStores);
+    // Phase 1: hoist range/stride checks out of loops where SCEV can prove
+    // the access pattern. Instructions placed in Hoisted are skipped by
+    // dedup.
+    DenseSet<Instruction *> Hoisted;
+    Res = hoistLoopChecks(F, Hoisted);
 
-  for (auto *Inst : AllLoadsAndStores) {
-    if (instrumentLoadOrStore(Inst, DL)) {
-      Res = true;
-      ++NumInstrumentedArbalestAccesses;
+    // Phase 2: per-element instrumentation for accesses not covered by
+    // hoisting. All four dedup modes are handled inside
+    // collectAccessesWithDedup. DM_Off simply emits every eligible access.
+    collectAccessesWithDedup(F, AA, Hoisted, AllLoadsAndStores);
+
+    for (auto *Inst : AllLoadsAndStores) {
+      if (instrumentLoadOrStore(Inst, DL)) {
+        Res = true;
+        ++NumInstrumentedArbalestAccesses;
+      }
     }
   }
 
