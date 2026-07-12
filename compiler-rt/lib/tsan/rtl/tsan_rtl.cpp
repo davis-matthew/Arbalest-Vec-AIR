@@ -692,6 +692,7 @@ void CheckUnwind() {
 bool is_initialized;
 
 bool arbalest_enabled;
+bool arbalest_simd_disabled;
 
 void Initialize(ThreadState *thr) {
   // Thread safe because done before all threads exist.

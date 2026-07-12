@@ -694,6 +694,7 @@ ALWAYS_INLINE void ProcessPendingSignals(ThreadState *thr) {
 
 extern bool is_initialized;
 extern bool arbalest_enabled;
+extern bool arbalest_simd_disabled;
 void ArbalestPrintCallCounts();
 
 ALWAYS_INLINE
