@@ -802,6 +802,8 @@ int Finalize(ThreadState *thr) {
 
   ThreadFinalize(thr);
 
+  ArbalestPrintCallCounts();
+
   if (ctx->nreported) {
     failed = true;
 #if !SANITIZER_GO

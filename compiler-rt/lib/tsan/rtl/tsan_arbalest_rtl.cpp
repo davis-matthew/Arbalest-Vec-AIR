@@ -4,6 +4,54 @@ typedef __m64 m64;
 
 namespace __tsan {
 
+// --- Arbalest call-count instrumentation ---
+//
+// Counts how many times each __arbalest_* interface function actually fires
+// at runtime, keyed by the same type names arbalest_ablation.sh already uses
+// for its static (IR call-site) counts. Always counted (cheap atomic
+// increment); only printed to stderr at process exit when
+// ARBALEST_COUNT_CALLS is set in the environment, so arbalest_ablation.sh can
+// compare "static call sites in the IR" against "calls actually executed for
+// this input" per call type.
+#define ARBALEST_CALL_TYPES(X)                                \
+  X(read1) X(read2) X(read4) X(read8) X(read16)                \
+  X(write1) X(write2) X(write4) X(write8) X(write16)            \
+  X(unaligned_read2) X(unaligned_read4) X(unaligned_read8)      \
+  X(unaligned_read16)                                           \
+  X(unaligned_write2) X(unaligned_write4) X(unaligned_write8)   \
+  X(unaligned_write16)                                          \
+  X(read_range) X(write_range)                                  \
+  X(read_stride) X(write_stride)                                \
+  X(read_cstride) X(write_cstride)
+
+enum ArbalestCallType {
+#define X(name) kArbalestCall_##name,
+  ARBALEST_CALL_TYPES(X)
+#undef X
+  kArbalestCallTypeCount
+};
+
+static const char *const kArbalestCallTypeNames[kArbalestCallTypeCount] = {
+#define X(name) #name,
+  ARBALEST_CALL_TYPES(X)
+#undef X
+};
+
+static atomic_uintptr_t arbalest_call_counts[kArbalestCallTypeCount];
+
+ALWAYS_INLINE void ArbalestCountCall(ArbalestCallType type) {
+  atomic_fetch_add(&arbalest_call_counts[type], 1, memory_order_relaxed);
+}
+
+void ArbalestPrintCallCounts() {
+  if (!arbalest_enabled || !GetEnv("ARBALEST_COUNT_CALLS"))
+    return;
+  for (int i = 0; i < kArbalestCallTypeCount; i++) {
+    uptr n = atomic_load(&arbalest_call_counts[i], memory_order_relaxed);
+    Printf("ARBALEST_CALL_COUNT %s %zu\n", kArbalestCallTypeNames[i], n);
+  }
+}
+
 static ALWAYS_INLINE void StoreVsm4(RawVsm *vp, RawVsm val) {
   u32 v = static_cast<u8>(val);
   v = (v << 24) | (v << 16) | (v << 8) | v;

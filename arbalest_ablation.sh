@@ -20,6 +20,22 @@
 #                    Use this to supply headers, link paths, etc. that your
 #                    source file needs.  Example:
 #                      --cflags "-I/usr/lib/gcc/x86_64-redhat-linux/11/include"
+#   --input-sizes "N1 N2 ..."
+#                    Run each compiled binary once per size, passing the size
+#                    as argv[1] (e.g. "$binpath" "N1"). Your source file's
+#                    main() must itself read argv[1] and use it (e.g.
+#                    `int n = argc > 1 ? atoi(argv[1]) : DEFAULT;`) for sizes
+#                    to actually change behavior — this flag only controls
+#                    what gets passed on the command line. Prints one
+#                    Instrumentation Summary table per size at the end of the
+#                    report. Without this flag, the binary is run once with
+#                    no arguments (unchanged default behavior).
+#   --repeat N       Run each binary N times per (config, size) and report
+#                    the median wall-clock time in run(ms) columns, instead
+#                    of a single noisy sample. Default: 3. Call-count and
+#                    violation output are only captured from the first run
+#                    (they're deterministic for a fixed input — only timing
+#                    needs repeats).
 #
 # Configurations tested (dedup × hoist):
 #   [0] baseline       off   × false  — raw instrumentation, no optimizations
@@ -48,6 +64,8 @@ NO_RUN=false
 RUN_OMPSAN=false
 OUT_DIR=""
 EXTRA_CFLAGS=""
+INPUT_SIZES_RAW=""
+REPEAT=3
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,14 +76,35 @@ while [[ $# -gt 0 ]]; do
         --out-dir=*)        OUT_DIR="${1#*=}"; shift ;;
         --cflags)           EXTRA_CFLAGS="$2"; shift 2 ;;
         --cflags=*)         EXTRA_CFLAGS="${1#*=}"; shift ;;
+        --input-sizes)      INPUT_SIZES_RAW="$2"; shift 2 ;;
+        --input-sizes=*)    INPUT_SIZES_RAW="${1#*=}"; shift ;;
+        --repeat)           REPEAT="$2";     shift 2 ;;
+        --repeat=*)         REPEAT="${1#*=}"; shift ;;
         -*)  printf 'Unknown option: %s\n' "$1" >&2; exit 1 ;;
         *)   break ;;
     esac
 done
 
+if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [[ "$REPEAT" -lt 1 ]]; then
+    printf 'ERROR: --repeat must be a positive integer (got: %s)\n' "$REPEAT" >&2
+    exit 1
+fi
+
+# INPUT_SIZES holds the argv[1] values to run each binary with. A single
+# empty-string entry means "run with no arguments" (the pre-existing,
+# single-run default behavior).
+if [[ -n "$INPUT_SIZES_RAW" ]]; then
+    # shellcheck disable=SC2206
+    INPUT_SIZES=($INPUT_SIZES_RAW)
+else
+    INPUT_SIZES=("")
+fi
+MULTI_SIZE=false
+[[ ${#INPUT_SIZES[@]} -gt 1 ]] && MULTI_SIZE=true
+
 INPUT="${1:-}"
 if [[ -z "$INPUT" || ! -f "$INPUT" ]]; then
-    printf 'Usage: %s [--no-color] [--no-run] [--out-dir DIR] [--cflags "FLAGS"] <file.ll|file.c>\n' "$0" >&2
+    printf 'Usage: %s [--no-color] [--no-run] [--out-dir DIR] [--cflags "FLAGS"] [--input-sizes "N1 N2 ..."] [--repeat N] <file.ll|file.c>\n' "$0" >&2
     exit 1
 fi
 
@@ -94,6 +133,19 @@ done
 
 # ── ms timestamp ──────────────────────────────────────────────────────────────
 ms_now() { printf '%d' "$(( $(date +%s%N) / 1000000 ))"; }
+
+# Median of N integer ms samples (average of the middle two if N is even).
+median_of() {
+    local -a vals=("$@")
+    local -a sorted
+    IFS=$'\n' sorted=($(sort -n <<< "${vals[*]}")); unset IFS
+    local n=${#sorted[@]} mid=$(( ${#sorted[@]} / 2 ))
+    if (( n % 2 == 1 )); then
+        printf '%d' "${sorted[$mid]}"
+    else
+        printf '%d' "$(( (sorted[mid-1] + sorted[mid]) / 2 ))"
+    fi
+}
 
 # ── configuration matrix ──────────────────────────────────────────────────────
 # Each entry: "short_slug|display label|dedupe_mode|hoist"
@@ -164,16 +216,30 @@ emit_ir() {
 # grep -c exits 1 (no matches) but still prints "0"; capture with || n=0
 # to avoid the double-print that occurs with the naive "|| printf '0'" form.
 #
-# IMPORTANT: @llvm.embedded.object is the device IR stored as a single-line
-# text-escaped string constant in the host module (used by -fopenmp-targets).
-# It contains escaped call instructions (e.g. "\0Acall void @__arbalest_..."),
-# which grep would count as real calls. Strip that line before matching.
+# IMPORTANT: @llvm.embedded.object is the *device*-side IR (the outlined
+# omp-target kernel body), stored as a single-line text-escaped string
+# constant in the host module (that's how -fopenmp-targets packages device
+# code for offload alongside the host code in the same .ll file). Real call
+# sites can live ONLY inside that blob (e.g. a hoisted range/stride call
+# emitted for the device kernel's loop) — they never appear unescaped
+# anywhere else in the file — so they must be counted, not discarded.
+#
+# grep -c on the raw blob line would badly undercount: the whole blob is one
+# gigantic physical line (original newlines became literal "\0A" two-char
+# escape sequences), so `grep -c` — which counts matching *lines*, not
+# occurrences — would report at most 1 for a type no matter how many times
+# it actually appears in that line. Restore the escaped newlines first so
+# each instruction is back on its own line, then reuse the exact same
+# per-line counting logic used for the host IR.
 count_type() {
     local ir_file="$1" suffix="$2"
-    local n
-    n=$(grep -v '@llvm\.embedded\.object' "$ir_file" | \
-        grep -cE "\bcall\b.*@__arbalest_${suffix}\(" 2>/dev/null) || n=0
-    printf '%d' "${n:-0}"
+    local n_host n_dev
+    n_host=$(grep -v '@llvm\.embedded\.object' "$ir_file" | \
+        grep -cE "\bcall\b.*@__arbalest_${suffix}\(" 2>/dev/null) || n_host=0
+    n_dev=$(grep '@llvm\.embedded\.object' "$ir_file" 2>/dev/null | \
+        sed 's/\\0A/\n/g' | \
+        grep -cE "\bcall\b.*@__arbalest_${suffix}\(" 2>/dev/null) || n_dev=0
+    printf '%d' "$(( ${n_host:-0} + ${n_dev:-0} ))"
 }
 
 # ── collect results ───────────────────────────────────────────────────────────
@@ -191,6 +257,21 @@ declare -a VIOLATIONS   # captured stderr from binary run per config
 declare -A PE_CNT       # PE_CNT[ci,type] — aligned per-element by type
 declare -A UA_CNT       # UA_CNT[ci,type] — unaligned per-element by type
 declare -A HT_CNT       # HT_CNT[ci,type] — hoisted by type
+
+declare -A RT_CNT       # RT_CNT[ci,type] — actual runtime calls, measured
+                        # (mirrors the first --input-sizes entry; existing
+                        # single-run sections below read from these)
+declare -a RT_TOTAL     # total measured runtime calls per config (first size)
+declare -a RT_OK        # "ok" if runtime counts were captured for this config,
+                        # else a short reason string (first size)
+
+# Per-(config,size) results, keyed "$ci,$sz". $sz is the literal --input-sizes
+# value (or "" for the single no-args default run). Used by the final
+# Instrumentation Summary table(s), which are per input size.
+declare -A RT_CNT_SZ    # RT_CNT_SZ[ci,sz,type]
+declare -A RT_TOTAL_SZ  # RT_TOTAL_SZ[ci,sz]
+declare -A RT_OK_SZ     # RT_OK_SZ[ci,sz]
+declare -A BIN_MS_SZ    # BIN_MS_SZ[ci,sz]
 
 # OMPSan-guided variants (populated only when --ompsan is set)
 declare -a OS_IR_FILE   # path to saved OMPSan-guided IR per config
@@ -252,10 +333,18 @@ for (( ci=0; ci<NC; ci++ )); do
     done
     HT_TOTAL[$ci]=$ht_total
 
-    # Binary compilation + run (only for .c files)
+    # Binary compilation (once per config, independent of --input-sizes) +
+    # run (once per entry in INPUT_SIZES; a single "" entry if not given).
     if $NO_RUN; then
         BIN_MS[$ci]="-"
         VIOLATIONS[$ci]=""
+        RT_OK[$ci]="no binary (--no-run or .ll input)"
+        RT_TOTAL[$ci]=0
+        for sz in "${INPUT_SIZES[@]}"; do
+            BIN_MS_SZ["$ci,$sz"]="-"
+            RT_OK_SZ["$ci,$sz"]="no binary (--no-run or .ll input)"
+            RT_TOTAL_SZ["$ci,$sz"]=0
+        done
         printf 'IR(%dms)\n' "${IR_MS[$ci]}"
     else
         binpath="$TMPDIR_ABL/bin_${ci}"
@@ -273,18 +362,86 @@ for (( ci=0; ci<NC; ci++ )); do
                 -L"$BUILD/lib" -Wl,-rpath,"$BUILD/lib" \
                 "$INPUT" -o "$binpath" 2>"$bin_log" \
            && [[ -x "$binpath" ]]; then
-            t0=$(ms_now)
-            viol=$(LD_LIBRARY_PATH="$BUILD/lib:${LD_LIBRARY_PATH:-}" \
-                   OMP_TOOL_LIBRARIES="$BUILD/lib/libarcher.so" \
-                   TSAN_OPTIONS='ignore_noninstrumented_modules=1' \
-                   "$binpath" 2>&1 || true)
-            t1=$(ms_now)
-            BIN_MS[$ci]=$(( t1 - t0 ))
-            VIOLATIONS[$ci]="$viol"
-            printf 'IR(%dms) run(%dms)\n' "${IR_MS[$ci]}" "${BIN_MS[$ci]}"
+            printf 'IR(%dms)' "${IR_MS[$ci]}"
+            first_sz=true
+            for sz in "${INPUT_SIZES[@]}"; do
+                bin_args=()
+                [[ -n "$sz" ]] && bin_args=("$sz")
+
+                # Run REPEAT times; report the median wall-clock time (single
+                # samples are noisy — dominated by TSan shadow-memory setup
+                # and OpenMP thread-pool spin-up, both scheduler-dependent).
+                # Call counts/violations are deterministic for a fixed input,
+                # so only the first run's output is parsed for those.
+                rep_times=()
+                for (( rep=1; rep<=REPEAT; rep++ )); do
+                    t0=$(ms_now)
+                    # ARBALEST_COUNT_CALLS=1 makes the tsan runtime dump one
+                    # "ARBALEST_CALL_COUNT <type> <n>" line per call type to
+                    # stderr at exit, so we can measure actual invocation
+                    # counts alongside the static (IR call-site) counts
+                    # collected above.
+                    run_out=$(LD_LIBRARY_PATH="$BUILD/lib:${LD_LIBRARY_PATH:-}" \
+                           OMP_TOOL_LIBRARIES="$BUILD/lib/libarcher.so" \
+                           TSAN_OPTIONS='ignore_noninstrumented_modules=1' \
+                           ARBALEST_COUNT_CALLS=1 \
+                           "$binpath" "${bin_args[@]}" 2>&1 || true)
+                    t1=$(ms_now)
+                    rep_times+=( $(( t1 - t0 )) )
+                    [[ $rep -eq 1 ]] && first_run_out="$run_out"
+                done
+                bin_ms=$(median_of "${rep_times[@]}")
+                BIN_MS_SZ["$ci,$sz"]=$bin_ms
+                viol="$(grep -v '^ARBALEST_CALL_COUNT ' <<< "$first_run_out")"
+
+                counts_raw="$(grep '^ARBALEST_CALL_COUNT ' <<< "$first_run_out")"
+                if [[ -n "$counts_raw" ]]; then
+                    RT_OK_SZ["$ci,$sz"]="ok"
+                    rt_total=0
+                    while read -r _ rt_typ rt_n; do
+                        [[ -z "$rt_typ" ]] && continue
+                        RT_CNT_SZ["$ci,$sz,$rt_typ"]=$rt_n
+                        rt_total=$(( rt_total + rt_n ))
+                    done <<< "$counts_raw"
+                    RT_TOTAL_SZ["$ci,$sz"]=$rt_total
+                else
+                    RT_OK_SZ["$ci,$sz"]="no ARBALEST_CALL_COUNT output (rebuild the tsan runtime with call-count instrumentation)"
+                    RT_TOTAL_SZ["$ci,$sz"]=0
+                fi
+
+                if [[ -n "$sz" ]]; then
+                    printf ' run[n=%s](median of %d: %dms)' "$sz" "$REPEAT" "$bin_ms"
+                else
+                    printf ' run(median of %d: %dms)' "$REPEAT" "$bin_ms"
+                fi
+
+                # Mirror the first size's results into the original unkeyed
+                # arrays so every pre-existing single-run section (Measured
+                # runtime call counts, Violation reports, etc.) keeps working
+                # unchanged, using the first size as "the" representative run.
+                if $first_sz; then
+                    BIN_MS[$ci]=$bin_ms
+                    VIOLATIONS[$ci]="$viol"
+                    RT_OK[$ci]="${RT_OK_SZ["$ci,$sz"]}"
+                    RT_TOTAL[$ci]=${RT_TOTAL_SZ["$ci,$sz"]}
+                    for typ in "${PE_TYPES[@]}" "${UA_TYPES[@]}" "${HT_TYPES[@]}"; do
+                        [[ -v "RT_CNT_SZ[$ci,$sz,$typ]" ]] && \
+                            RT_CNT["$ci,$typ"]=${RT_CNT_SZ["$ci,$sz,$typ"]}
+                    done
+                    first_sz=false
+                fi
+            done
+            printf '\n'
         else
             BIN_MS[$ci]="ERR"
             VIOLATIONS[$ci]="(compilation failed; see ${bin_log})"
+            RT_OK[$ci]="binary compilation failed"
+            RT_TOTAL[$ci]=0
+            for sz in "${INPUT_SIZES[@]}"; do
+                BIN_MS_SZ["$ci,$sz"]="ERR"
+                RT_OK_SZ["$ci,$sz"]="binary compilation failed"
+                RT_TOTAL_SZ["$ci,$sz"]=0
+            done
             printf 'IR(%dms) run(ERR)\n' "${IR_MS[$ci]}"
             if [[ -s "$bin_log" ]]; then
                 head -3 "$bin_log" | sed 's/^/    /' >&2
@@ -483,6 +640,81 @@ for (( ci=0; ci<NC; ci++ )); do
 done
 printf '\n'
 
+# ── measured runtime call counts (actual execution) ───────────────────────────
+# Looks up the static (IR call-site) count for a type, checking whichever of
+# PE_CNT/UA_CNT/HT_CNT it belongs to.
+static_count() {
+    local ci="$1" typ="$2"
+    if [[ -v "PE_CNT[$ci,$typ]" ]]; then printf '%s' "${PE_CNT[$ci,$typ]}"
+    elif [[ -v "UA_CNT[$ci,$typ]" ]]; then printf '%s' "${UA_CNT[$ci,$typ]}"
+    else printf '%s' "${HT_CNT[$ci,$typ]:-0}"
+    fi
+}
+
+if ! $NO_RUN; then
+    bold '── Measured runtime call counts (actual execution, this input) ─────────'
+    printf '\n'
+    printf '  static  = call sites emitted in the IR (from the tables above).\n'
+    printf '  runtime = times that call site'"'"'s __arbalest_* callback actually\n'
+    printf '            fired while the binary ran just now. A hoisted call site\n'
+    printf '            can fire far fewer times than a per-element site covering\n'
+    printf '            the same accesses (e.g. one write_stride call vs. T write\n'
+    printf '            calls for a loop of trip count T).\n'
+    printf '\n'
+
+    ALL_TYPES=("${PE_TYPES[@]}" "${UA_TYPES[@]}" "${HT_TYPES[@]}")
+
+    for (( ci=0; ci<NC; ci++ )); do
+        $USE_COLOR && printf '  \033[1m[%d] %s\033[0m\n' "$ci" "$(cfg_label $ci)" \
+                   || printf '  [%d] %s\n' "$ci" "$(cfg_label $ci)"
+
+        if [[ "${RT_OK[$ci]}" != "ok" ]]; then
+            printf '      (%s)\n\n' "${RT_OK[$ci]}"
+            continue
+        fi
+
+        printf '      %-20s  %10s  %10s\n' "type" "static" "runtime"
+        printf '      %s\n' "$(printf -- '-%.0s' {1..44})"
+        any_row=0
+        for typ in "${ALL_TYPES[@]}"; do
+            s=$(static_count "$ci" "$typ")
+            r=${RT_CNT["$ci,$typ"]:-0}
+            if [[ $s -gt 0 || $r -gt 0 ]]; then
+                printf '      %-20s  %10d  %10d\n' "$typ" "$s" "$r"
+                any_row=1
+            fi
+        done
+        [[ $any_row -eq 0 ]] && printf '      (no calls, static or runtime)\n'
+        printf '      %s\n' "$(printf -- '-%.0s' {1..44})"
+        static_all=$(( PE_TOTAL[$ci] + UA_TOTAL[$ci] + HT_TOTAL[$ci] ))
+        printf '      %-20s  %10d  %10d\n' "total" "$static_all" "${RT_TOTAL[$ci]}"
+        printf '\n'
+    done
+
+    bold '── Measured calls removed vs baseline [0] (actual execution) ───────────'
+    printf '\n'
+    printf '  Positive = fewer calls actually executed than baseline, for this input.\n'
+    printf '\n'
+    printf '  %-*s  %10s\n' $LW "configuration" "removed"
+    printf '  %s\n' "$SEP"
+    if [[ "${RT_OK[0]}" == "ok" ]]; then
+        base_rt=${RT_TOTAL[0]}
+        for (( ci=0; ci<NC; ci++ )); do
+            if [[ $ci -eq 0 ]]; then
+                printf '  %-*s  %10s\n' $LW "[$ci] $(cfg_label $ci)" "— (baseline)"
+            elif [[ "${RT_OK[$ci]}" == "ok" ]]; then
+                printf '  %-*s  %10d\n' $LW "[$ci] $(cfg_label $ci)" \
+                    "$(( base_rt - RT_TOTAL[$ci] ))"
+            else
+                printf '  %-*s  %10s\n' $LW "[$ci] $(cfg_label $ci)" "N/A"
+            fi
+        done
+    else
+        printf '  N/A (no measured baseline: %s)\n' "${RT_OK[0]}"
+    fi
+    printf '\n'
+fi
+
 # ── runtime call projection ────────────────────────────────────────────────────
 bold '── Projected runtime call count (per loop invocation at trip count T) ──'
 printf '\n'
@@ -655,6 +887,89 @@ if $RUN_OMPSAN; then
             "$ci" "$status" "${OS_IR_FILE[$ci]}" "${OS_IR_MS[$ci]:-0}"
     done
     printf '\n'
+fi
+
+# ── instrumentation summary (one table per --input-sizes entry) ───────────────
+# One row per configuration: static call-site counts and measured dynamic
+# call counts (both broken out by type), plus IR-pass time and executable
+# runtime. Only types with a nonzero count somewhere (static or dynamic, any
+# config, any size) get a column, to keep the table from being mostly zeros.
+abbr_type() {
+    local typ="$1" abbr
+    case "$typ" in
+        read_range)    abbr="rdrng" ;;
+        write_range)   abbr="wrrng" ;;
+        read_stride)   abbr="rdstr" ;;
+        write_stride)  abbr="wrstr" ;;
+        read_cstride)  abbr="rdcst" ;;
+        write_cstride) abbr="wrcst" ;;
+        unaligned_read*)  abbr="ur${typ#unaligned_read}" ;;
+        unaligned_write*) abbr="uw${typ#unaligned_write}" ;;
+        read*)  abbr="r${typ#read}" ;;
+        write*) abbr="w${typ#write}" ;;
+        *)      abbr="$typ" ;;
+    esac
+    printf '%s' "$abbr"
+}
+
+ALL_TYPES_SUMMARY=("${PE_TYPES[@]}" "${UA_TYPES[@]}" "${HT_TYPES[@]}")
+ACTIVE_TYPES=()
+for typ in "${ALL_TYPES_SUMMARY[@]}"; do
+    active=false
+    for (( ci=0; ci<NC; ci++ )); do
+        s=$(static_count "$ci" "$typ")
+        if [[ $s -gt 0 ]]; then active=true; break; fi
+        for sz in "${INPUT_SIZES[@]}"; do
+            d=${RT_CNT_SZ["$ci,$sz,$typ"]:-0}
+            if [[ $d -gt 0 ]]; then active=true; break; fi
+        done
+        $active && break
+    done
+    $active && ACTIVE_TYPES+=("$typ")
+done
+
+print_instrumentation_summary() {
+    local sz="$1" title
+    if [[ -n "$sz" ]]; then
+        title="Instrumentation Summary — input size: $sz"
+    elif $MULTI_SIZE; then
+        title="Instrumentation Summary — default run (no argv)"
+    else
+        title="Instrumentation Summary"
+    fi
+    bold "── $title ──"
+    printf '\n'
+    if $NO_RUN; then
+        printf '  (--no-run: dynamic counts and executable runtime were not measured;\n'
+        printf '   dynamic columns show 0, not "measured zero".)\n\n'
+    fi
+
+    printf '  %-*s' $LW "configuration"
+    for typ in "${ACTIVE_TYPES[@]}"; do printf '  %7s' "s_$(abbr_type "$typ")"; done
+    for typ in "${ACTIVE_TYPES[@]}"; do printf '  %7s' "d_$(abbr_type "$typ")"; done
+    printf '  %8s  %8s\n' "IR(ms)" "run(ms)"
+    printf '  %s\n' "$SEP"
+
+    for (( ci=0; ci<NC; ci++ )); do
+        printf '  %-*s' $LW "[$ci] $(cfg_label $ci)"
+        for typ in "${ACTIVE_TYPES[@]}"; do
+            printf '  %7d' "$(static_count "$ci" "$typ")"
+        done
+        for typ in "${ACTIVE_TYPES[@]}"; do
+            printf '  %7d' "${RT_CNT_SZ["$ci,$sz,$typ"]:-0}"
+        done
+        printf '  %8d  %8s\n' "${IR_MS[$ci]}" "${BIN_MS_SZ["$ci,$sz"]:-"-"}"
+    done
+    printf '\n'
+}
+
+if [[ ${#ACTIVE_TYPES[@]} -eq 0 ]]; then
+    bold '── Instrumentation Summary ──────────────────────────────────────────────'
+    printf '\n  (no __arbalest_* call sites found in any configuration)\n\n'
+else
+    for sz in "${INPUT_SIZES[@]}"; do
+        print_instrumentation_summary "$sz"
+    done
 fi
 
 bold '════════════════════════════════════════════════════════════════════════'

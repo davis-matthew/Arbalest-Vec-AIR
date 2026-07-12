@@ -21,74 +21,92 @@ void __arbalest_init(u32 global_num, void **global_ptr,
 }
 
 void __arbalest_read1(void *addr) {
+  ArbalestCountCall(kArbalestCall_read1);
   CheckVsm(cur_thread(), CALLERPC, (uptr)addr, 1);
 }
 
 void __arbalest_read2(void *addr) {
+  ArbalestCountCall(kArbalestCall_read2);
   CheckVsm(cur_thread(), CALLERPC, (uptr)addr, 2);
 }
 
 void __arbalest_read4(void *addr) {
+  ArbalestCountCall(kArbalestCall_read4);
   CheckVsm(cur_thread(), CALLERPC, (uptr)addr, 4);
 }
 
 void __arbalest_read8(void *addr) {
+  ArbalestCountCall(kArbalestCall_read8);
   CheckVsm(cur_thread(), CALLERPC, (uptr)addr, 8);
 }
 
 void __arbalest_read16(void *addr) {
+  ArbalestCountCall(kArbalestCall_read16);
   CheckVsm16(cur_thread(), CALLERPC, (uptr)addr);
 }
 
 void __arbalest_write1(void *addr) {
+  ArbalestCountCall(kArbalestCall_write1);
   UpdateVsm(cur_thread(), (uptr)addr, 1);
 }
 
 void __arbalest_write2(void *addr) {
+  ArbalestCountCall(kArbalestCall_write2);
   UpdateVsm(cur_thread(), (uptr)addr, 2);
 }
 
 void __arbalest_write4(void *addr){
+  ArbalestCountCall(kArbalestCall_write4);
   UpdateVsm(cur_thread(), (uptr)addr, 4);
 }
 
 void __arbalest_write8(void *addr) {
+  ArbalestCountCall(kArbalestCall_write8);
   UpdateVsm(cur_thread(), (uptr)addr, 8);
 }
 
 void __arbalest_write16(void *addr) {
+  ArbalestCountCall(kArbalestCall_write16);
   UpdateVsm16(cur_thread(), (uptr)addr);
 }
 
 void __arbalest_unaligned_read2(const void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_read2);
   UnalignedCheckVsm(cur_thread(), CALLERPC, (uptr)addr, 2);
 }
 
 void __arbalest_unaligned_read4(const void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_read4);
   UnalignedCheckVsm(cur_thread(), CALLERPC, (uptr)addr, 4);
 }
 
 void __arbalest_unaligned_read8(const void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_read8);
   UnalignedCheckVsm(cur_thread(), CALLERPC, (uptr)addr, 8);
 }
 
 void __arbalest_unaligned_read16(const void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_read16);
   UnalignedCheckVsm16(cur_thread(), CALLERPC, (uptr)addr);
 }
 
 void __arbalest_unaligned_write2(void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_write2);
   UnalignedUpdateVsm(cur_thread(), (uptr)addr, 2);
 }
 
 void __arbalest_unaligned_write4(void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_write4);
   UnalignedUpdateVsm(cur_thread(), (uptr)addr, 4);
 }
 
 void __arbalest_unaligned_write8(void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_write8);
   UnalignedUpdateVsm(cur_thread(), (uptr)addr, 8);
 }
 
 void __arbalest_unaligned_write16(void *addr) {
+  ArbalestCountCall(kArbalestCall_unaligned_write16);
   UnalignedUpdateVsm16(cur_thread(), (uptr)addr);
 }
 
@@ -137,12 +155,14 @@ static void UpdateVsmStridedRange(ThreadState *thr, uptr start, uptr end,
 // --- contiguous range ---
 
 void __arbalest_read_range(void *start, void *end) {
+  ArbalestCountCall(kArbalestCall_read_range);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   CheckVsmForMemoryRange(cur_thread(), CALLERPC, s, e - s);
 }
 
 void __arbalest_write_range(void *start, void *end) {
+  ArbalestCountCall(kArbalestCall_write_range);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   UpdateVsmForMemoryRange(cur_thread(), s, e - s);
@@ -151,12 +171,14 @@ void __arbalest_write_range(void *start, void *end) {
 // --- dynamic stride ---
 
 void __arbalest_read_stride(void *start, void *end, uptr step, uptr elem_bytes) {
+  ArbalestCountCall(kArbalestCall_read_stride);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   CheckVsmStridedRange(cur_thread(), CALLERPC, s, e, step, elem_bytes);
 }
 
 void __arbalest_write_stride(void *start, void *end, uptr step, uptr elem_bytes) {
+  ArbalestCountCall(kArbalestCall_write_stride);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   UpdateVsmStridedRange(cur_thread(), s, e, step, elem_bytes);
@@ -165,6 +187,7 @@ void __arbalest_write_stride(void *start, void *end, uptr step, uptr elem_bytes)
 // --- constant stride (SIMD specializations for step == 16) ---
 
 void __arbalest_read_cstride(void *start, void *end, uptr step, uptr elem_bytes) {
+  ArbalestCountCall(kArbalestCall_read_cstride);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   ThreadState *thr = cur_thread();
@@ -179,6 +202,7 @@ void __arbalest_read_cstride(void *start, void *end, uptr step, uptr elem_bytes)
 }
 
 void __arbalest_write_cstride(void *start, void *end, uptr step, uptr elem_bytes) {
+  ArbalestCountCall(kArbalestCall_write_cstride);
   uptr s = (uptr)start, e = (uptr)end;
   if (LIKELY(s >= e)) return;
   ThreadState *thr = cur_thread();
