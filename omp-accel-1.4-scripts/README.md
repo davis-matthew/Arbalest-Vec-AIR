@@ -1,0 +1,2 @@
+These scripts are for the omp-accel-1.4 evaluation, but I think there are some small errors in the way it launches one of the benchmarks which can lead to a OOM crash? Definitely do not trust these 100%.
+Just putting these here for a jumping off point.
